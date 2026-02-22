@@ -309,7 +309,7 @@ async def call_claude(prompt: str, session_id: str, is_new: bool = True,
     else:
         cmd += ["--resume", session_id]
 
-    log.info(f"Calling claude with session {session_id[:8]}...")
+    log.info(f"Calling claude with session {session_id[:8]}... (is_new={is_new})")
 
     env = os.environ.copy()
     env.pop("CLAUDECODE", None)
@@ -326,6 +326,7 @@ async def call_claude(prompt: str, session_id: str, is_new: bool = True,
         start_time = asyncio.get_event_loop().time()
         last_event_time = start_time
         current_activity = "Starting..."
+        received_events = False  # Track if Claude started processing
         final_result = None
         result_subtype = None
         result_errors = []
@@ -347,6 +348,10 @@ async def call_claude(prompt: str, session_id: str, is_new: bool = True,
                     proc.kill()
                 except Exception:
                     pass
+                # If we received events, session was created on disk
+                if received_events and is_new:
+                    mark_session_initialized_by_sid(session_id)
+                    log.info(f"Marked session {session_id[:8]} as initialized (timeout after events)")
                 return f"[Timeout] Total timeout ({CLAUDE_TIMEOUT}s) exceeded."
 
             # Stall detection
@@ -356,6 +361,10 @@ async def call_claude(prompt: str, session_id: str, is_new: bool = True,
                     proc.kill()
                 except Exception:
                     pass
+                # If we received events, session was created on disk
+                if received_events and is_new:
+                    mark_session_initialized_by_sid(session_id)
+                    log.info(f"Marked session {session_id[:8]} as initialized (stall after events)")
                 return (
                     f"[Stall] No activity for {STALL_TIMEOUT}s, likely stuck.\n"
                     f"Last activity: {current_activity}\n"
@@ -397,6 +406,8 @@ async def call_claude(prompt: str, session_id: str, is_new: bool = True,
             except json.JSONDecodeError:
                 continue
 
+            received_events = True
+
             # Extract activity for display
             activity = _format_activity(event)
             if activity:
@@ -437,6 +448,10 @@ async def call_claude(prompt: str, session_id: str, is_new: bool = True,
         # Wait for process to finish
         await proc.wait()
 
+        # Mark session as initialized if we received any events
+        if received_events and is_new:
+            mark_session_initialized_by_sid(session_id)
+
         # --- Result extraction priority ---
         # 1. result event's result field (best case: Claude provided final text)
         if final_result:
@@ -464,6 +479,13 @@ async def call_claude(prompt: str, session_id: str, is_new: bool = True,
         stderr = await proc.stderr.read()
         err = stderr.decode("utf-8", errors="replace").strip()
         if proc.returncode != 0 and err:
+            # Auto-retry: if "already in use" and we tried --session-id, retry with --resume
+            if is_new and "already in use" in err:
+                log.warning(f"Session {session_id[:8]} already exists on disk, retrying with --resume")
+                mark_session_initialized_by_sid(session_id)
+                return await call_claude(prompt, session_id, is_new=False,
+                                         thinking_msg=thinking_msg, chat=chat,
+                                         session_name=session_name)
             return f"Error Claude CLI failed (code {proc.returncode}):\n{err}"
 
         return "[Task completed but no summary was produced by Claude.]"
@@ -763,9 +785,8 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
             session_name=session_name,
         )
 
-        # Mark session as initialized after successful call
-        if is_new and not response.startswith("Error") and not response.startswith("[Timeout]") and not response.startswith("[Stall]"):
-            mark_session_initialized_by_sid(session_id)
+        # Note: session initialization is now handled inside call_claude itself
+        # (marked as initialized once any events are received from Claude CLI)
 
         # Delete the "thinking" message
         try:
