@@ -379,80 +379,76 @@ async def call_claude(prompt: str, session_id: str, is_new: bool = True,
                         except Exception:
                             pass
 
-            # Try to read a line with heartbeat interval timeout
-            try:
-                line = await asyncio.wait_for(
-                    proc.stdout.readline(), timeout=HEARTBEAT_INTERVAL
-                )
-            except asyncio.TimeoutError:
-                # No new line - send heartbeat with current activity
-                if thinking_msg:
-                    mins, secs = divmod(elapsed, 60)
-                    time_str = f"{mins}m{secs:02d}s" if mins else f"{secs}s"
-                    label = f"[{session_name}] " if session_name else ""
-                    try:
-                        await thinking_msg.edit_text(
-                            f"{label}{current_activity} ({time_str})"
-                        )
-                    except Exception:
-                        pass
-                if chat:
-                    try:
-                        await chat.send_action(ChatAction.TYPING)
-                    except Exception:
-                        pass
-                continue
+                # Try to read a line with heartbeat interval timeout
+                try:
+                    line = await asyncio.wait_for(
+                        proc.stdout.readline(), timeout=HEARTBEAT_INTERVAL
+                    )
+                except asyncio.TimeoutError:
+                    # No new line - send heartbeat with current activity
+                    if thinking_msg and not stall_warned:
+                        mins, secs = divmod(elapsed, 60)
+                        time_str = f"{mins}m{secs:02d}s" if mins else f"{secs}s"
+                        label = f"[{session_name}] " if session_name else ""
+                        try:
+                            await thinking_msg.edit_text(
+                                f"{label}{current_activity} ({time_str})"
+                            )
+                        except Exception:
+                            pass
+                    if chat:
+                        try:
+                            await chat.send_action(ChatAction.TYPING)
+                        except Exception:
+                            pass
+                    continue
 
-            if not line:
-                # EOF - process ended
-                break
+                if not line:
+                    # EOF - process ended
+                    break
 
-            # Parse the JSON event
-            last_event_time = asyncio.get_event_loop().time()
-            try:
-                event = json.loads(line.decode("utf-8", errors="replace"))
-            except json.JSONDecodeError:
-                continue
+                # Parse the JSON event
+                last_event_time = asyncio.get_event_loop().time()
+                try:
+                    event = json.loads(line.decode("utf-8", errors="replace"))
+                except json.JSONDecodeError:
+                    continue
 
-            received_events = True
-            stall_warned = False  # Reset: events are flowing again
+                received_events = True
+                stall_warned = False  # Reset: events are flowing again
 
-            # Extract activity for display
-            activity = _format_activity(event)
-            if activity:
-                current_activity = activity
+                # Extract activity for display
+                activity = _format_activity(event)
+                if activity:
+                    current_activity = activity
 
-            # Capture result
-            if event.get("type") == "result":
-                final_result = event.get("result", "")
-                result_subtype = event.get("subtype", "")
-                result_errors = event.get("errors", [])
-                result_num_turns = event.get("num_turns", 0)
-            elif event.get("type") == "assistant":
-                has_text = False
-                has_tool = False
-                for block in event.get("message", {}).get("content", []):
-                    if block.get("type") == "text":
-                        text = block.get("text", "").strip()
-                        if text:
-                            current_turn_text.append(text)
-                            has_text = True
-                    elif block.get("type") == "tool_use":
-                        has_tool = True
-                # When we see a tool_use, the current text is intermediate narration.
-                # When we see text-only (no tool), it's likely a final response.
-                # Save and reset per-turn tracking on each assistant message.
-                if current_turn_text:
-                    if has_tool:
-                        # Text before tool calls = intermediate narration, discard for final output
-                        current_turn_text = []
-                    else:
-                        # Text-only assistant message = likely final response
-                        last_assistant_text_parts = current_turn_text[:]
-                        current_turn_text = []
-            elif event.get("type") == "user":
-                # New user turn = reset, any subsequent assistant text is fresh
-                current_turn_text = []
+                # Capture result
+                if event.get("type") == "result":
+                    final_result = event.get("result", "")
+                    result_subtype = event.get("subtype", "")
+                    result_errors = event.get("errors", [])
+                    result_num_turns = event.get("num_turns", 0)
+                elif event.get("type") == "assistant":
+                    has_text = False
+                    has_tool = False
+                    for block in event.get("message", {}).get("content", []):
+                        if block.get("type") == "text":
+                            text = block.get("text", "").strip()
+                            if text:
+                                current_turn_text.append(text)
+                                has_text = True
+                        elif block.get("type") == "tool_use":
+                            has_tool = True
+                    # When we see a tool_use, the current text is intermediate narration.
+                    # When we see text-only (no tool), it's likely a final response.
+                    if current_turn_text:
+                        if has_tool:
+                            current_turn_text = []
+                        else:
+                            last_assistant_text_parts = current_turn_text[:]
+                            current_turn_text = []
+                elif event.get("type") == "user":
+                    current_turn_text = []
 
         finally:
             # Clean up process tracking
