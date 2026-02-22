@@ -327,7 +327,13 @@ async def call_claude(prompt: str, session_id: str, is_new: bool = True,
         last_event_time = start_time
         current_activity = "Starting..."
         final_result = None
-        all_text_parts = []
+        result_subtype = None
+        result_errors = []
+        result_num_turns = 0
+        # Track text per-turn: list of (turn_index, text) pairs
+        # Only the LAST assistant turn's text is the final response
+        last_assistant_text_parts = []
+        current_turn_text = []
 
         while True:
             now = asyncio.get_event_loop().time()
@@ -399,27 +405,68 @@ async def call_claude(prompt: str, session_id: str, is_new: bool = True,
             # Capture result
             if event.get("type") == "result":
                 final_result = event.get("result", "")
+                result_subtype = event.get("subtype", "")
+                result_errors = event.get("errors", [])
+                result_num_turns = event.get("num_turns", 0)
             elif event.get("type") == "assistant":
+                has_text = False
+                has_tool = False
                 for block in event.get("message", {}).get("content", []):
                     if block.get("type") == "text":
-                        all_text_parts.append(block["text"])
+                        text = block.get("text", "").strip()
+                        if text:
+                            current_turn_text.append(text)
+                            has_text = True
+                    elif block.get("type") == "tool_use":
+                        has_tool = True
+                # When we see a tool_use, the current text is intermediate narration.
+                # When we see text-only (no tool), it's likely a final response.
+                # Save and reset per-turn tracking on each assistant message.
+                if current_turn_text:
+                    if has_tool:
+                        # Text before tool calls = intermediate narration, discard for final output
+                        current_turn_text = []
+                    else:
+                        # Text-only assistant message = likely final response
+                        last_assistant_text_parts = current_turn_text[:]
+                        current_turn_text = []
+            elif event.get("type") == "user":
+                # New user turn = reset, any subsequent assistant text is fresh
+                current_turn_text = []
 
         # Wait for process to finish
         await proc.wait()
 
-        # Return result
+        # --- Result extraction priority ---
+        # 1. result event's result field (best case: Claude provided final text)
         if final_result:
             return final_result
-        if all_text_parts:
-            return "\n".join(all_text_parts)
 
-        # Fallback: read any remaining stderr
+        # 2. Handle error subtypes from result event
+        if result_subtype and result_subtype != "success":
+            if result_subtype == "error_max_turns":
+                # Claude hit max turns - return last text we saw + warning
+                summary = "\n".join(last_assistant_text_parts) if last_assistant_text_parts else ""
+                warning = f"\n\n[Reached max turns ({result_num_turns}). Task may be incomplete.]"
+                return (summary + warning) if summary else f"[Reached max turns ({result_num_turns}). No summary produced.]"
+            elif result_errors:
+                return f"[Error] {'; '.join(result_errors)}"
+
+        # 3. Last text-only assistant message (the actual conversational response)
+        if last_assistant_text_parts:
+            return "\n".join(last_assistant_text_parts)
+
+        # 4. If we have leftover current_turn_text (text that preceded the final tool call)
+        if current_turn_text:
+            return "\n".join(current_turn_text)
+
+        # 5. Fallback: read any remaining stderr
         stderr = await proc.stderr.read()
         err = stderr.decode("utf-8", errors="replace").strip()
         if proc.returncode != 0 and err:
             return f"Error Claude CLI failed (code {proc.returncode}):\n{err}"
 
-        return "No output from Claude"
+        return "[Task completed but no summary was produced by Claude.]"
 
     except FileNotFoundError:
         return "Error claude CLI not found. Make sure it's in PATH."
