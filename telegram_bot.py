@@ -48,8 +48,8 @@ CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT", "1800"))
 # Heartbeat interval: send "still working" update every N seconds
 HEARTBEAT_INTERVAL = int(os.environ.get("HEARTBEAT_INTERVAL", "30"))
 
-# Stall detection: kill process if no new events for this many seconds
-STALL_TIMEOUT = int(os.environ.get("STALL_TIMEOUT", "300"))
+# Stall warning: warn user (not kill) if no new events for this many seconds
+STALL_WARN_TIMEOUT = int(os.environ.get("STALL_WARN_TIMEOUT", "300"))
 
 # Max agentic turns to prevent infinite loops
 MAX_TURNS = int(os.environ.get("CLAUDE_MAX_TURNS", "30"))
@@ -82,6 +82,10 @@ session_locks: dict[str, asyncio.Lock] = {}
 
 # Per-session pending message queue count
 session_pending: dict[str, int] = {}
+
+# Per-session running process: session_id -> asyncio.subprocess.Process
+# Used by /kill command to terminate stuck sessions
+session_processes: dict[str, asyncio.subprocess.Process] = {}
 
 # Auto-increment session counter per user for default naming
 user_session_counter: dict[int, int] = {}
@@ -323,10 +327,14 @@ async def call_claude(prompt: str, session_id: str, is_new: bool = True,
             env=env,
         )
 
+        # Register process for /kill command
+        session_processes[session_id] = proc
+
         start_time = asyncio.get_event_loop().time()
         last_event_time = start_time
         current_activity = "Starting..."
         received_events = False  # Track if Claude started processing
+        stall_warned = False  # Only warn once per stall period
         final_result = None
         result_subtype = None
         result_errors = []
@@ -336,40 +344,40 @@ async def call_claude(prompt: str, session_id: str, is_new: bool = True,
         last_assistant_text_parts = []
         current_turn_text = []
 
-        while True:
-            now = asyncio.get_event_loop().time()
-            elapsed = int(now - start_time)
-            since_last_event = int(now - last_event_time)
+        try:
+            while True:
+                now = asyncio.get_event_loop().time()
+                elapsed = int(now - start_time)
+                since_last_event = int(now - last_event_time)
 
-            # Total timeout
-            if elapsed >= CLAUDE_TIMEOUT:
-                log.error(f"Claude CLI timed out after {elapsed}s")
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
-                # If we received events, session was created on disk
-                if received_events and is_new:
-                    mark_session_initialized_by_sid(session_id)
-                    log.info(f"Marked session {session_id[:8]} as initialized (timeout after events)")
-                return f"[Timeout] Total timeout ({CLAUDE_TIMEOUT}s) exceeded."
+                # Total timeout - the ONLY auto-kill mechanism
+                if elapsed >= CLAUDE_TIMEOUT:
+                    log.error(f"Claude CLI timed out after {elapsed}s")
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                    if received_events and is_new:
+                        mark_session_initialized_by_sid(session_id)
+                    return f"[Timeout] Total timeout ({CLAUDE_TIMEOUT}s) exceeded. Use /kill to stop earlier."
 
-            # Stall detection
-            if since_last_event >= STALL_TIMEOUT:
-                log.error(f"Claude stalled - no events for {since_last_event}s")
-                try:
-                    proc.kill()
-                except Exception:
-                    pass
-                # If we received events, session was created on disk
-                if received_events and is_new:
-                    mark_session_initialized_by_sid(session_id)
-                    log.info(f"Marked session {session_id[:8]} as initialized (stall after events)")
-                return (
-                    f"[Stall] No activity for {STALL_TIMEOUT}s, likely stuck.\n"
-                    f"Last activity: {current_activity}\n"
-                    f"Total elapsed: {elapsed}s"
-                )
+                # Stall warning - warn user but do NOT kill
+                # (Long API calls produce no events, killing them is wrong)
+                if since_last_event >= STALL_WARN_TIMEOUT and not stall_warned:
+                    stall_warned = True
+                    log.warning(f"No events for {since_last_event}s, session {session_id[:8]} may be in long API call")
+                    if thinking_msg:
+                        mins, secs = divmod(elapsed, 60)
+                        time_str = f"{mins}m{secs:02d}s" if mins else f"{secs}s"
+                        label = f"[{session_name}] " if session_name else ""
+                        try:
+                            await thinking_msg.edit_text(
+                                f"{label}Long thinking... no events for {since_last_event}s ({time_str})\n"
+                                f"Last: {current_activity}\n"
+                                f"Use /kill {session_name} if stuck"
+                            )
+                        except Exception:
+                            pass
 
             # Try to read a line with heartbeat interval timeout
             try:
@@ -407,6 +415,7 @@ async def call_claude(prompt: str, session_id: str, is_new: bool = True,
                 continue
 
             received_events = True
+            stall_warned = False  # Reset: events are flowing again
 
             # Extract activity for display
             activity = _format_activity(event)
@@ -445,8 +454,15 @@ async def call_claude(prompt: str, session_id: str, is_new: bool = True,
                 # New user turn = reset, any subsequent assistant text is fresh
                 current_turn_text = []
 
-        # Wait for process to finish
-        await proc.wait()
+        finally:
+            # Clean up process tracking
+            session_processes.pop(session_id, None)
+
+            # Wait for process to finish
+            try:
+                await proc.wait()
+            except Exception:
+                pass
 
         # Mark session as initialized if we received any events
         if received_events and is_new:
@@ -460,7 +476,6 @@ async def call_claude(prompt: str, session_id: str, is_new: bool = True,
         # 2. Handle error subtypes from result event
         if result_subtype and result_subtype != "success":
             if result_subtype == "error_max_turns":
-                # Claude hit max turns - return last text we saw + warning
                 summary = "\n".join(last_assistant_text_parts) if last_assistant_text_parts else ""
                 warning = f"\n\n[Reached max turns ({result_num_turns}). Task may be incomplete.]"
                 return (summary + warning) if summary else f"[Reached max turns ({result_num_turns}). No summary produced.]"
@@ -556,7 +571,8 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         f"/clear - Reset current session\n"
         f"/status - Bot status\n"
         f"/cd <path> - Change working dir\n"
-        f"/session - Current session info\n\n"
+        f"/session - Current session info\n"
+        f"/kill [name] - Kill stuck session\n\n"
         f"Send any message to interact with Claude.\n"
         f"Use `@name msg` to send to a specific session.\n"
         f"Different sessions run in parallel!",
@@ -740,6 +756,57 @@ async def cmd_session(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("No active session. Send a message to start one.")
 
 
+async def cmd_kill(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /kill [session_name] - kill a running Claude process."""
+    user_id = update.effective_user.id
+    if not is_authorized(user_id):
+        return
+
+    sessions = user_all_sessions.get(user_id, {})
+    if not sessions:
+        await update.message.reply_text("No sessions.")
+        return
+
+    # Determine target session
+    if ctx.args:
+        target_name = ctx.args[0]
+    else:
+        # Default: kill active session
+        target_name = user_active_session.get(user_id)
+
+    if not target_name or target_name not in sessions:
+        # Show busy sessions as hint
+        busy = []
+        for name, sid in sessions.items():
+            if sid in session_processes:
+                busy.append(name)
+        if busy:
+            await update.message.reply_text(
+                f"Session `{target_name}` not found.\nBusy sessions: {', '.join(f'`{n}`' for n in busy)}\n"
+                f"Usage: /kill <session_name>",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+        else:
+            await update.message.reply_text("No busy sessions to kill.")
+        return
+
+    sid = sessions[target_name]
+    proc = session_processes.get(sid)
+    if not proc:
+        await update.message.reply_text(f"Session `{target_name}` is not running.", parse_mode=ParseMode.MARKDOWN)
+        return
+
+    try:
+        proc.kill()
+        log.info(f"User killed session {target_name} ({sid[:8]})")
+        await update.message.reply_text(
+            f"Killed session `{target_name}`.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    except Exception as e:
+        await update.message.reply_text(f"Failed to kill: {e}")
+
+
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle regular text messages - forward to Claude with per-session parallel execution."""
     user_id = update.effective_user.id
@@ -828,6 +895,7 @@ def main():
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("cd", cmd_cd))
     app.add_handler(CommandHandler("session", cmd_session))
+    app.add_handler(CommandHandler("kill", cmd_kill))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     log.info("Bot is polling...")
