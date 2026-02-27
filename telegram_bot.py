@@ -4,17 +4,34 @@ Telegram Bot for Claude Code remote interaction.
 Allows controlling Claude Code via Telegram messages from your phone.
 """
 
+import argparse
 import asyncio
 import json
 import logging
 import os
+import re
+import sys
 import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 from dotenv import load_dotenv
-load_dotenv(Path(__file__).parent / ".env")
+
+# Support --instance flag to load named env file from instances/ directory
+_parser = argparse.ArgumentParser(add_help=False)
+_parser.add_argument("--instance", type=str, default=None,
+                     help="Instance name (loads instances/<name>.env)")
+_args, _ = _parser.parse_known_args()
+
+if _args.instance:
+    _env_path = Path(__file__).parent / "instances" / f"{_args.instance}.env"
+    if not _env_path.exists():
+        print(f"Error: {_env_path} not found", file=sys.stderr)
+        sys.exit(1)
+    load_dotenv(_env_path, override=True)
+else:
+    load_dotenv(Path(__file__).parent / ".env", override=True)
 
 from telegram import Update
 from telegram.ext import (
@@ -42,8 +59,8 @@ if ALLOWED_USER_IDS_ENV:
 # Working directory for claude CLI
 WORK_DIR = os.environ.get("CLAUDE_WORK_DIR", os.getcwd())
 
-# Claude CLI timeout (seconds) - 30 min default, complex tasks can take long
-CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT", "1800"))
+# Claude CLI timeout (seconds) - 0 means no timeout, rely on --max-turns and /kill
+CLAUDE_TIMEOUT = int(os.environ.get("CLAUDE_TIMEOUT", "0"))
 
 # Heartbeat interval: send "still working" update every N seconds
 HEARTBEAT_INTERVAL = int(os.environ.get("HEARTBEAT_INTERVAL", "30"))
@@ -53,6 +70,10 @@ STALL_WARN_TIMEOUT = int(os.environ.get("STALL_WARN_TIMEOUT", "300"))
 
 # Max agentic turns to prevent infinite loops
 MAX_TURNS = int(os.environ.get("CLAUDE_MAX_TURNS", "30"))
+
+# Upload directory for files received from Telegram
+UPLOAD_DIR = os.environ.get("UPLOAD_DIR", os.path.join(WORK_DIR, "uploads"))
+os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 # Telegram message max length
 TG_MAX_LEN = 4000
@@ -325,6 +346,7 @@ async def call_claude(prompt: str, session_id: str, is_new: bool = True,
             stderr=asyncio.subprocess.PIPE,
             cwd=WORK_DIR,
             env=env,
+            limit=1024 * 1024,  # 1MB buffer limit (default 64KB too small for stream-json)
         )
 
         # Register process for /kill command
@@ -350,8 +372,9 @@ async def call_claude(prompt: str, session_id: str, is_new: bool = True,
                 elapsed = int(now - start_time)
                 since_last_event = int(now - last_event_time)
 
-                # Total timeout - the ONLY auto-kill mechanism
-                if elapsed >= CLAUDE_TIMEOUT:
+                # Total timeout - only if explicitly configured (CLAUDE_TIMEOUT > 0)
+                # Default: no timeout, rely on --max-turns and /kill
+                if CLAUDE_TIMEOUT > 0 and elapsed >= CLAUDE_TIMEOUT:
                     log.error(f"Claude CLI timed out after {elapsed}s")
                     try:
                         proc.kill()
@@ -534,6 +557,93 @@ def split_message(text: str, max_len: int = TG_MAX_LEN) -> list[str]:
         text = text[split_pos:].lstrip("\n")
 
     return parts
+
+
+# ─── File auto-send ──────────────────────────────────────────────────────────
+
+# Image extensions that can be sent as photos (Telegram supports these natively)
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+
+# File extensions worth auto-sending (common output formats)
+SENDABLE_EXTS = IMAGE_EXTS | {
+    ".pdf", ".csv", ".xlsx", ".xls", ".docx", ".doc",
+    ".html", ".svg", ".mp4", ".mp3", ".zip", ".tar", ".gz",
+    ".txt", ".md", ".json",
+}
+
+# Telegram file size limit (50MB for bots)
+TG_FILE_SIZE_LIMIT = 50 * 1024 * 1024
+
+# Regex to find file paths in response text
+# Matches absolute paths and paths starting with ./
+_FILE_PATH_RE = re.compile(
+    r'(?:^|[\s`\'"])(/[\w./_-]+\.[\w]+|\.\/[\w./_-]+\.[\w]+)',
+)
+
+
+def extract_sendable_files(text: str) -> list[tuple[str, bool]]:
+    """Extract file paths from response text that exist on disk and are worth sending.
+
+    Returns list of (path, is_image) tuples, deduplicated and ordered by appearance.
+    """
+    seen = set()
+    files = []
+
+    for match in _FILE_PATH_RE.finditer(text):
+        path = match.group(1)
+        # Resolve relative paths against WORK_DIR
+        if path.startswith("./"):
+            path = os.path.join(WORK_DIR, path[2:])
+        path = os.path.abspath(path)
+
+        if path in seen:
+            continue
+        seen.add(path)
+
+        if not os.path.isfile(path):
+            continue
+
+        ext = os.path.splitext(path)[1].lower()
+        if ext not in SENDABLE_EXTS:
+            continue
+
+        # Check file size
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            continue
+        if size == 0 or size > TG_FILE_SIZE_LIMIT:
+            continue
+
+        is_image = ext in IMAGE_EXTS
+        files.append((path, is_image))
+
+    return files
+
+
+async def send_files_to_chat(chat, files: list[tuple[str, bool]], session_name: str = ""):
+    """Send extracted files to Telegram chat as photos or documents."""
+    from telegram import InputFile
+
+    label = f"[{session_name}] " if session_name else ""
+
+    for path, is_image in files:
+        filename = os.path.basename(path)
+        try:
+            with open(path, "rb") as f:
+                if is_image:
+                    await chat.send_photo(
+                        photo=InputFile(f, filename=filename),
+                        caption=f"{label}{filename}",
+                    )
+                else:
+                    await chat.send_document(
+                        document=InputFile(f, filename=filename),
+                        caption=f"{label}{filename}",
+                    )
+            log.info(f"Sent file to chat: {path}")
+        except Exception as e:
+            log.warning(f"Failed to send file {path}: {e}")
 
 
 # ─── Telegram handlers ───────────────────────────────────────────────────────
@@ -803,6 +913,111 @@ async def cmd_kill(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(f"Failed to kill: {e}")
 
 
+async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle file/photo/video uploads - download to server and optionally forward to Claude."""
+    user_id = update.effective_user.id
+    if not is_authorized(user_id):
+        await update.message.reply_text("Unauthorized. Send /start first.")
+        return
+
+    msg = update.message
+    file_obj = None
+    original_name = None
+
+    # Priority: document > photo > video > audio > voice > video_note
+    if msg.document:
+        file_obj = msg.document
+        original_name = msg.document.file_name or f"doc_{int(datetime.now().timestamp())}"
+    elif msg.photo:
+        # photo is a list of sizes, take the largest
+        file_obj = msg.photo[-1]
+        original_name = f"photo_{int(datetime.now().timestamp())}.jpg"
+    elif msg.video:
+        file_obj = msg.video
+        original_name = msg.video.file_name or f"video_{int(datetime.now().timestamp())}.mp4"
+    elif msg.audio:
+        file_obj = msg.audio
+        original_name = msg.audio.file_name or f"audio_{int(datetime.now().timestamp())}.mp3"
+    elif msg.voice:
+        file_obj = msg.voice
+        original_name = f"voice_{int(datetime.now().timestamp())}.ogg"
+    elif msg.video_note:
+        file_obj = msg.video_note
+        original_name = f"videonote_{int(datetime.now().timestamp())}.mp4"
+
+    if not file_obj:
+        await msg.reply_text("Unsupported file type.")
+        return
+
+    # Download file
+    try:
+        tg_file = await file_obj.get_file()
+        save_path = os.path.join(UPLOAD_DIR, original_name)
+
+        # Avoid overwriting: add suffix if exists
+        if os.path.exists(save_path):
+            base, ext = os.path.splitext(original_name)
+            save_path = os.path.join(UPLOAD_DIR, f"{base}_{int(datetime.now().timestamp())}{ext}")
+
+        await tg_file.download_to_drive(save_path)
+        log.info(f"File downloaded: {save_path} (from user {user_id})")
+    except Exception as e:
+        log.exception("File download failed")
+        await msg.reply_text(f"Download failed: {e}")
+        return
+
+    # If there's a caption, forward file path + caption to Claude as a prompt
+    caption = msg.caption or ""
+    if caption:
+        # Resolve session from caption FIRST (before prepending file path)
+        session_name, session_id, resolved_caption, is_new = resolve_session_target(user_id, caption)
+        prompt_text = f"File saved to: {save_path}\n\n{resolved_caption}"
+        lock = get_session_lock(session_id)
+
+        session_pending[session_id] = session_pending.get(session_id, 0) + 1
+        if lock.locked():
+            queue_pos = session_pending.get(session_id, 1)
+            await msg.reply_text(f"[{session_name}] File received, queued (position {queue_pos})...")
+
+        async with lock:
+            session_pending[session_id] = max(0, session_pending.get(session_id, 1) - 1)
+            is_new = not session_initialized.get(session_id, False)
+
+            await msg.chat.send_action(ChatAction.TYPING)
+            thinking_msg = await msg.reply_text(f"[{session_name}] Processing file + message...")
+
+            response = await call_claude(
+                prompt_text, session_id, is_new=is_new,
+                thinking_msg=thinking_msg, chat=msg.chat,
+                session_name=session_name,
+            )
+
+            try:
+                await thinking_msg.delete()
+            except Exception:
+                pass
+
+            parts = split_message(response)
+            for i, part in enumerate(parts):
+                labeled = f"[{session_name}] {part}" if i == 0 else part
+                try:
+                    await msg.reply_text(labeled, parse_mode=ParseMode.MARKDOWN)
+                except Exception:
+                    await msg.reply_text(labeled)
+
+            # Auto-send files/images found in response
+            sendable = extract_sendable_files(response)
+            if sendable:
+                await send_files_to_chat(msg.chat, sendable, session_name)
+    else:
+        # No caption - just confirm the file was saved
+        await msg.reply_text(
+            f"File saved to:\n`{save_path}`\n\n"
+            f"Send a message referencing this path to ask Claude about it.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle regular text messages - forward to Claude with per-session parallel execution."""
     user_id = update.effective_user.id
@@ -866,6 +1081,11 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
             except Exception:
                 await update.message.reply_text(labeled)
 
+        # Auto-send files/images found in response
+        sendable = extract_sendable_files(response)
+        if sendable:
+            await send_files_to_chat(update.message.chat, sendable, session_name)
+
 
 # ─── Main ────────────────────────────────────────────────────────────────────
 
@@ -893,6 +1113,10 @@ def main():
     app.add_handler(CommandHandler("session", cmd_session))
     app.add_handler(CommandHandler("kill", cmd_kill))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(
+        filters.Document.ALL | filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.VOICE | filters.VIDEO_NOTE,
+        handle_file,
+    ))
 
     log.info("Bot is polling...")
     app.run_polling(allowed_updates=Update.ALL_TYPES)

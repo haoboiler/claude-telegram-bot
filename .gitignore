@@ -1,5 +1,7 @@
 .env
+instances/*.env
 *.log
+logs/
 __pycache__/
 *.pyc
 .DS_Store
