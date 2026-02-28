@@ -522,6 +522,7 @@ async def call_claude(prompt: str, session_id: str,
         max_turns=MAX_TURNS,
         permission_mode="bypassPermissions",
         can_use_tool=_make_can_use_tool(chat, session_name) if chat else None,
+        setting_sources=["user", "project"],
     )
 
     # If we have a saved SDK session_id, resume it
@@ -1127,6 +1128,17 @@ async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
 
+async def handle_unknown_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Forward unrecognized /commands to Claude as skill invocations.
+
+    Claude agent has a Skill tool that can execute skills like /memo, /commit, etc.
+    Bot-specific commands (/start, /kill, etc.) are handled by their own handlers
+    and never reach here.
+    """
+    # Reuse handle_message logic with the full command text (including the /)
+    await handle_message(update, ctx)
+
+
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle regular text messages - forward to Claude with per-session parallel execution."""
     user_id = update.effective_user.id
@@ -1231,6 +1243,8 @@ def main():
     # AskUserQuestion callback handler (must be before general message handler)
     app.add_handler(CallbackQueryHandler(handle_ask_callback, pattern=r"^ask:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    # Catch-all: forward unrecognized /commands to Claude as skill invocations
+    app.add_handler(MessageHandler(filters.COMMAND, handle_unknown_command))
     app.add_handler(MessageHandler(
         filters.Document.ALL | filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.VOICE | filters.VIDEO_NOTE,
         handle_file,
