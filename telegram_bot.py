@@ -59,6 +59,10 @@ from claude_agent_sdk import (
     ProcessError,
 )
 
+# Remove CLAUDECODE env var to prevent nested session detection
+# (bot may be launched from within a Claude Code session)
+os.environ.pop("CLAUDECODE", None)
+
 # ─── Configuration ───────────────────────────────────────────────────────────
 
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
