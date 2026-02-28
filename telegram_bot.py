@@ -69,7 +69,7 @@ HEARTBEAT_INTERVAL = int(os.environ.get("HEARTBEAT_INTERVAL", "30"))
 STALL_WARN_TIMEOUT = int(os.environ.get("STALL_WARN_TIMEOUT", "300"))
 
 # Max agentic turns to prevent infinite loops
-MAX_TURNS = int(os.environ.get("CLAUDE_MAX_TURNS", "30"))
+MAX_TURNS = int(os.environ.get("CLAUDE_MAX_TURNS", "150"))
 
 # Upload directory for files received from Telegram
 UPLOAD_DIR = os.environ.get("UPLOAD_DIR", os.path.join(WORK_DIR, "uploads"))
@@ -312,13 +312,15 @@ def _format_activity(event: dict) -> Optional[str]:
 
 
 async def call_claude(prompt: str, session_id: str, is_new: bool = True,
-                      thinking_msg=None, chat=None, session_name: str = "") -> str:
+                      thinking_msg=None, chat=None, session_name: str = "") -> tuple[str, list[str]]:
     """Call claude CLI with stream-json output for real-time activity tracking.
 
     is_new: True = first message (use --session-id to create),
             False = subsequent (use --resume to continue)
     thinking_msg: the "Thinking..." message to update with activity
     chat: the chat object for sending typing actions
+
+    Returns: (response_text, activity_log) tuple
     """
     cmd = [
         "claude",
@@ -355,6 +357,9 @@ async def call_claude(prompt: str, session_id: str, is_new: bool = True,
         start_time = asyncio.get_event_loop().time()
         last_event_time = start_time
         current_activity = "Starting..."
+        activity_log = []  # Accumulated activity entries
+        last_edit_time = 0.0  # Throttle: last time we edited thinking_msg
+        EDIT_THROTTLE = 3.0  # Minimum seconds between edits
         received_events = False  # Track if Claude started processing
         stall_warned = False  # Only warn once per stall period
         final_result = None
@@ -382,7 +387,7 @@ async def call_claude(prompt: str, session_id: str, is_new: bool = True,
                         pass
                     if received_events and is_new:
                         mark_session_initialized_by_sid(session_id)
-                    return f"[Timeout] Total timeout ({CLAUDE_TIMEOUT}s) exceeded. Use /kill to stop earlier."
+                    return f"[Timeout] Total timeout ({CLAUDE_TIMEOUT}s) exceeded. Use /kill to stop earlier.", activity_log
 
                 # Stall warning - warn user but do NOT kill
                 # (Long API calls produce no events, killing them is wrong)
@@ -413,9 +418,13 @@ async def call_claude(prompt: str, session_id: str, is_new: bool = True,
                         mins, secs = divmod(elapsed, 60)
                         time_str = f"{mins}m{secs:02d}s" if mins else f"{secs}s"
                         label = f"[{session_name}] " if session_name else ""
+                        recent = activity_log[-10:] if activity_log else [current_activity]
+                        log_text = "\n".join(f"  ▸ {a}" for a in recent)
+                        if len(activity_log) > 10:
+                            log_text = f"  ... ({len(activity_log) - 10} earlier)\n" + log_text
                         try:
                             await thinking_msg.edit_text(
-                                f"{label}{current_activity} ({time_str})"
+                                f"{label}Working... ({time_str})\n{log_text}"
                             )
                         except Exception:
                             pass
@@ -444,6 +453,28 @@ async def call_claude(prompt: str, session_id: str, is_new: bool = True,
                 activity = _format_activity(event)
                 if activity:
                     current_activity = activity
+                    # Append to log (avoid duplicate consecutive entries)
+                    if not activity_log or activity_log[-1] != activity:
+                        activity_log.append(activity)
+                    # Throttled update of thinking_msg
+                    now2 = asyncio.get_event_loop().time()
+                    if thinking_msg and (now2 - last_edit_time) >= EDIT_THROTTLE:
+                        last_edit_time = now2
+                        elapsed2 = int(now2 - start_time)
+                        mins, secs = divmod(elapsed2, 60)
+                        time_str = f"{mins}m{secs:02d}s" if mins else f"{secs}s"
+                        label = f"[{session_name}] " if session_name else ""
+                        # Show last N activities to keep message readable
+                        recent = activity_log[-10:]
+                        log_text = "\n".join(f"  ▸ {a}" for a in recent)
+                        if len(activity_log) > 10:
+                            log_text = f"  ... ({len(activity_log) - 10} earlier)\n" + log_text
+                        try:
+                            await thinking_msg.edit_text(
+                                f"{label}Working... ({time_str})\n{log_text}"
+                            )
+                        except Exception:
+                            pass
 
                 # Capture result
                 if event.get("type") == "result":
@@ -490,24 +521,25 @@ async def call_claude(prompt: str, session_id: str, is_new: bool = True,
         # --- Result extraction priority ---
         # 1. result event's result field (best case: Claude provided final text)
         if final_result:
-            return final_result
+            return final_result, activity_log
 
         # 2. Handle error subtypes from result event
         if result_subtype and result_subtype != "success":
             if result_subtype == "error_max_turns":
                 summary = "\n".join(last_assistant_text_parts) if last_assistant_text_parts else ""
                 warning = f"\n\n[Reached max turns ({result_num_turns}). Task may be incomplete.]"
-                return (summary + warning) if summary else f"[Reached max turns ({result_num_turns}). No summary produced.]"
+                result = (summary + warning) if summary else f"[Reached max turns ({result_num_turns}). No summary produced.]"
+                return result, activity_log
             elif result_errors:
-                return f"[Error] {'; '.join(result_errors)}"
+                return f"[Error] {'; '.join(result_errors)}", activity_log
 
         # 3. Last text-only assistant message (the actual conversational response)
         if last_assistant_text_parts:
-            return "\n".join(last_assistant_text_parts)
+            return "\n".join(last_assistant_text_parts), activity_log
 
         # 4. If we have leftover current_turn_text (text that preceded the final tool call)
         if current_turn_text:
-            return "\n".join(current_turn_text)
+            return "\n".join(current_turn_text), activity_log
 
         # 5. Fallback: read any remaining stderr
         stderr = await proc.stderr.read()
@@ -520,15 +552,15 @@ async def call_claude(prompt: str, session_id: str, is_new: bool = True,
                 return await call_claude(prompt, session_id, is_new=False,
                                          thinking_msg=thinking_msg, chat=chat,
                                          session_name=session_name)
-            return f"Error Claude CLI failed (code {proc.returncode}):\n{err}"
+            return f"Error Claude CLI failed (code {proc.returncode}):\n{err}", activity_log
 
-        return "[Task completed but no summary was produced by Claude.]"
+        return "[Task completed but no summary was produced by Claude.]", activity_log
 
     except FileNotFoundError:
-        return "Error claude CLI not found. Make sure it's in PATH."
+        return "Error claude CLI not found. Make sure it's in PATH.", []
     except Exception as e:
         log.exception("Unexpected error calling claude")
-        return f"Error {type(e).__name__}: {e}"
+        return f"Error {type(e).__name__}: {e}", []
 
 
 # ─── Message splitting ───────────────────────────────────────────────────────
@@ -986,16 +1018,24 @@ async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             await msg.chat.send_action(ChatAction.TYPING)
             thinking_msg = await msg.reply_text(f"[{session_name}] Processing file + message...")
 
-            response = await call_claude(
+            response, activity_log = await call_claude(
                 prompt_text, session_id, is_new=is_new,
                 thinking_msg=thinking_msg, chat=msg.chat,
                 session_name=session_name,
             )
 
-            try:
-                await thinking_msg.delete()
-            except Exception:
-                pass
+            # Finalize the activity log message (keep it, don't delete)
+            if thinking_msg:
+                label = f"[{session_name}] " if session_name else ""
+                if activity_log:
+                    log_text = "\n".join(f"  ▸ {a}" for a in activity_log)
+                    final_log = f"{label}Done ({len(activity_log)} steps)\n{log_text}"
+                else:
+                    final_log = f"{label}Done"
+                try:
+                    await thinking_msg.edit_text(final_log)
+                except Exception:
+                    pass
 
             parts = split_message(response)
             for i, part in enumerate(parts):
@@ -1057,7 +1097,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
         thinking_msg = await update.message.reply_text(f"[{session_name}] Thinking...")
 
         # Call Claude: first msg creates session, subsequent msgs resume it
-        response = await call_claude(
+        response, activity_log = await call_claude(
             prompt, session_id, is_new=is_new,
             thinking_msg=thinking_msg, chat=update.message.chat,
             session_name=session_name,
@@ -1066,11 +1106,18 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
         # Note: session initialization is now handled inside call_claude itself
         # (marked as initialized once any events are received from Claude CLI)
 
-        # Delete the "thinking" message
-        try:
-            await thinking_msg.delete()
-        except Exception:
-            pass
+        # Finalize the activity log message (keep it, don't delete)
+        if thinking_msg:
+            label = f"[{session_name}] " if session_name else ""
+            if activity_log:
+                log_text = "\n".join(f"  ▸ {a}" for a in activity_log)
+                final_log = f"{label}Done ({len(activity_log)} steps)\n{log_text}"
+            else:
+                final_log = f"{label}Done"
+            try:
+                await thinking_msg.edit_text(final_log)
+            except Exception:
+                pass
 
         # Split and send response, prefixed with session name
         parts = split_message(response)

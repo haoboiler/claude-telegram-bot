@@ -38,7 +38,7 @@ No test suite or linter is configured.
 1. **Configuration** — Env vars loaded via `python-dotenv` from `.env` or `instances/<name>.env`
 2. **Session & Lock management** — In-memory dicts track sessions, locks, processes, and queue depth per user
 3. **Stream-JSON parsing** — Processes Claude CLI's `stream-json` output line-by-line; extracts activity descriptions and final results
-4. **`call_claude()`** — Core function: spawns `claude` as async subprocess, manages heartbeat updates, stall warnings, and result extraction
+4. **`call_claude()`** — Core function: spawns `claude` as async subprocess, maintains cumulative activity log, manages throttled updates (3s min interval), heartbeat, stall warnings, and result extraction. Returns `tuple[str, list[str]]` — `(response_text, activity_log)`
 5. **Message splitting** — Splits long responses at newline/space boundaries for Telegram's 4096-char limit (uses 4000 safety margin)
 6. **Telegram handlers** — Command handlers (`/start`, `/clear`, `/new`, `/switch`, `/sessions`, `/status`, `/cd`, `/session`, `/kill`) and message/file handlers
 7. **Main** — Builds `Application` with `concurrent_updates=True` and runs polling
@@ -66,7 +66,7 @@ No test suite or linter is configured.
 | `CLAUDE_TIMEOUT` | 0 (disabled) | Max seconds per Claude call |
 | `HEARTBEAT_INTERVAL` | 30 | Seconds between "Thinking..." updates |
 | `STALL_WARN_TIMEOUT` | 300 | Seconds before stall warning |
-| `CLAUDE_MAX_TURNS` | 30 | Max agentic turns per call |
+| `CLAUDE_MAX_TURNS` | 150 | Max agentic turns per call |
 | `UPLOAD_DIR` | `$CLAUDE_WORK_DIR/uploads` | Where uploaded files are saved |
 
 ## Important Implementation Details
@@ -75,6 +75,7 @@ No test suite or linter is configured.
 - Claude is invoked with `--dangerously-skip-permissions` flag
 - Stream-json result extraction has a priority chain: result event > error subtype > last text-only assistant turn > leftover text > stderr fallback
 - Text from assistant events preceding a `tool_use` is discarded as intermediate narration
+- Activity log is cumulative (appended, not overwritten); on completion the "Working..." message is edited to show the full log instead of being deleted, and the final result is sent as a separate message below it
 - Auth: if `TELEGRAM_ALLOWED_USERS` is empty, the first `/start` user is auto-registered
 
 ## Multi-Instance Support

@@ -5,9 +5,10 @@ Telegram Bot that acts as a remote interface to [Claude Code](https://docs.anthr
 ## Features
 
 - **Multi-Session**: Run multiple independent Claude sessions in parallel (`/new`, `/switch`, `@name msg`)
-- **Real-Time Activity**: Stream-JSON output shows what Claude is doing (Reading files, Running commands, etc.)
-- **Heartbeat**: Updates "Thinking..." message every 30s with elapsed time and current activity
-- **Stall Detection**: Auto-kills stuck processes if no output for 5 minutes
+- **Activity Log**: Cumulative activity log shows every step Claude takes; preserved after completion for review
+- **Real-Time Updates**: Throttled live updates (every 3s) show current progress ("Reading file.py", "Running: npm test")
+- **Stall Warning**: Warns if no output for 5 minutes (does not auto-kill; use `/kill` instead)
+- **File Upload**: Send files from phone to server; optionally forward to Claude with caption
 - **Session Routing**: Send messages to specific sessions with `@session_name your message`
 - **Message Queue**: Per-session locking with queue position feedback
 
@@ -19,9 +20,9 @@ User (Telegram)
     -> resolve session target (@name prefix or active session)
     -> per-session asyncio.Lock (different sessions run in parallel)
     -> claude -p --output-format stream-json --verbose
-      -> real-time activity parsing
+      -> real-time activity log (cumulative, throttled updates)
       -> heartbeat updates every 30s
-      -> stall detection (kill if no events for 5 min)
+      -> stall warning (warn if no events for 5 min, suggest /kill)
     -> Response -> Bot -> User (with [session_name] prefix)
 ```
 
@@ -53,19 +54,26 @@ cp .env.example .env
 | `TELEGRAM_BOT_TOKEN` | (required) | Bot API token from BotFather |
 | `TELEGRAM_ALLOWED_USERS` | (empty) | Comma-separated user IDs (empty = auto-register first user) |
 | `CLAUDE_WORK_DIR` | `cwd` | Claude Code working directory |
-| `CLAUDE_TIMEOUT` | `1800` | Total timeout per call (seconds) |
-| `HEARTBEAT_INTERVAL` | `30` | Activity update interval (seconds) |
-| `STALL_TIMEOUT` | `300` | Kill if no output for N seconds |
-| `CLAUDE_MAX_TURNS` | `30` | Max agentic turns per call |
+| `CLAUDE_TIMEOUT` | `0` (disabled) | Total timeout per call (0 = no timeout, use `--max-turns` and `/kill`) |
+| `HEARTBEAT_INTERVAL` | `30` | Heartbeat interval (seconds) |
+| `STALL_WARN_TIMEOUT` | `300` | Warn (not kill) if no output for N seconds |
+| `CLAUDE_MAX_TURNS` | `150` | Max agentic turns per call |
+| `UPLOAD_DIR` | `WORK_DIR/uploads` | Directory for files uploaded via Telegram |
 
 ### 4. Run
 
 ```bash
-# Foreground
+# Foreground (reads .env)
 python3 telegram_bot.py
 
-# Background
-nohup python3 telegram_bot.py > telegram_bot.log 2>&1 &
+# Named instance (reads instances/<name>.env)
+python3 telegram_bot.py --instance mybot
+
+# Instance management
+./start.sh mybot          # start instance, log to logs/mybot.log
+./stop.sh mybot           # stop instance
+./start.sh all            # start all instances
+./stop.sh all             # stop all instances
 ```
 
 ## Commands
@@ -80,7 +88,10 @@ nohup python3 telegram_bot.py > telegram_bot.log 2>&1 &
 | `/status` | Bot status and queue info |
 | `/cd <path>` | Change working directory |
 | `/session` | Current session info |
+| `/kill [name]` | Kill stuck session |
 | `@name msg` | Send to specific session without switching |
+| (file) | Download to server, reply with saved path |
+| (file + caption) | Download + forward path & caption to Claude |
 
 ## Multi-Session Usage
 
