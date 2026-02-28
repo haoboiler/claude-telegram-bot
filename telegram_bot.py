@@ -2,15 +2,18 @@
 """
 Telegram Bot for Claude Code remote interaction.
 Allows controlling Claude Code via Telegram messages from your phone.
+
+Uses Claude Agent SDK for structured communication with Claude Code,
+including AskUserQuestion support via Telegram inline keyboards.
 """
 
 import argparse
 import asyncio
-import json
 import logging
 import os
 import re
 import sys
+import time
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -33,15 +36,28 @@ if _args.instance:
 else:
     load_dotenv(Path(__file__).parent / ".env", override=True)
 
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
     filters,
 )
 from telegram.constants import ParseMode, ChatAction
+
+from claude_agent_sdk import (
+    ClaudeSDKClient,
+    ClaudeAgentOptions,
+    AssistantMessage,
+    ResultMessage,
+    ToolUseBlock,
+    TextBlock,
+    PermissionResultAllow,
+    CLINotFoundError,
+    ProcessError,
+)
 
 # ─── Configuration ───────────────────────────────────────────────────────────
 
@@ -71,6 +87,9 @@ STALL_WARN_TIMEOUT = int(os.environ.get("STALL_WARN_TIMEOUT", "300"))
 # Max agentic turns to prevent infinite loops
 MAX_TURNS = int(os.environ.get("CLAUDE_MAX_TURNS", "150"))
 
+# AskUserQuestion timeout (seconds) - how long to wait for user to answer
+ASK_USER_TIMEOUT = int(os.environ.get("ASK_USER_TIMEOUT", "300"))
+
 # Upload directory for files received from Telegram
 UPLOAD_DIR = os.environ.get("UPLOAD_DIR", os.path.join(WORK_DIR, "uploads"))
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -91,12 +110,11 @@ log = logging.getLogger("claude-tg-bot")
 # Per-user current active session name: user_id -> session_name
 user_active_session: dict[int, str] = {}
 
-# Per-user all sessions: user_id -> {session_name: session_id}
+# Per-user all sessions: user_id -> {session_name: local_session_id}
 user_all_sessions: dict[int, dict[str, str]] = {}
 
-# Track whether a session has been used (first msg uses --session-id, subsequent use --resume)
-# Key: session_id (not user_id), so each session tracks its own init state
-session_initialized: dict[str, bool] = {}
+# local_session_id -> SDK session_id (set after first successful call)
+session_sdk_ids: dict[str, str] = {}
 
 # Per-SESSION asyncio lock: allows different sessions to run in parallel
 session_locks: dict[str, asyncio.Lock] = {}
@@ -104,12 +122,17 @@ session_locks: dict[str, asyncio.Lock] = {}
 # Per-session pending message queue count
 session_pending: dict[str, int] = {}
 
-# Per-session running process: session_id -> asyncio.subprocess.Process
-# Used by /kill command to terminate stuck sessions
-session_processes: dict[str, asyncio.subprocess.Process] = {}
+# Per-session running client: local_session_id -> ClaudeSDKClient
+# Used by /kill command to interrupt stuck sessions
+session_clients: dict[str, ClaudeSDKClient] = {}
 
 # Auto-increment session counter per user for default naming
 user_session_counter: dict[int, int] = {}
+
+# Pending AskUserQuestion futures: question_id -> asyncio.Future
+pending_questions: dict[str, asyncio.Future] = {}
+# question_id -> list of original options (for resolving callback index)
+pending_question_options: dict[str, list[dict]] = {}
 
 
 def get_session_lock(session_id: str) -> asyncio.Lock:
@@ -126,34 +149,26 @@ def _next_default_name(user_id: int) -> str:
     return f"s{cnt}"
 
 
-def get_or_create_session(user_id: int) -> tuple[str, bool]:
-    """Get existing session or create a new one. Returns (session_id, is_new)."""
+def get_or_create_session(user_id: int) -> str:
+    """Get existing session or create a new one. Returns local_session_id."""
     if user_id not in user_all_sessions:
         user_all_sessions[user_id] = {}
 
     active_name = user_active_session.get(user_id)
     if active_name and active_name in user_all_sessions[user_id]:
-        sid = user_all_sessions[user_id][active_name]
-        is_new = not session_initialized.get(sid, False)
-        return sid, is_new
+        return user_all_sessions[user_id][active_name]
 
     # No active session - create default
     name = _next_default_name(user_id)
     sid = str(uuid.uuid4())
     user_all_sessions[user_id][name] = sid
     user_active_session[user_id] = name
-    session_initialized[sid] = False
     log.info(f"New session for user {user_id}: {name} ({sid})")
-    return sid, True
-
-
-def mark_session_initialized_by_sid(sid: str):
-    """Mark a session as initialized after first successful call."""
-    session_initialized[sid] = True
+    return sid
 
 
 def create_new_session(user_id: int, name: Optional[str] = None) -> tuple[str, str]:
-    """Create a new session and switch to it. Returns (name, session_id)."""
+    """Create a new session and switch to it. Returns (name, local_session_id)."""
     if user_id not in user_all_sessions:
         user_all_sessions[user_id] = {}
 
@@ -171,7 +186,6 @@ def create_new_session(user_id: int, name: Optional[str] = None) -> tuple[str, s
     sid = str(uuid.uuid4())
     user_all_sessions[user_id][name] = sid
     user_active_session[user_id] = name
-    session_initialized[sid] = False
     log.info(f"Created session for user {user_id}: {name} ({sid})")
     return name, sid
 
@@ -190,10 +204,9 @@ def clear_session(user_id: int) -> str:
     """Clear current session and create a new one (replaces current slot)."""
     old_name = user_active_session.get(user_id)
     if old_name and user_id in user_all_sessions:
-        # Remove old session
         old_sid = user_all_sessions[user_id].pop(old_name, None)
         if old_sid:
-            session_initialized.pop(old_sid, None)
+            session_sdk_ids.pop(old_sid, None)
 
     name = _next_default_name(user_id)
     sid = str(uuid.uuid4())
@@ -201,7 +214,6 @@ def clear_session(user_id: int) -> str:
         user_all_sessions[user_id] = {}
     user_all_sessions[user_id][name] = sid
     user_active_session[user_id] = name
-    session_initialized[sid] = False
     log.info(f"Session cleared for user {user_id}, new: {name} ({sid})")
     return sid
 
@@ -218,10 +230,10 @@ def list_sessions(user_id: int) -> list[tuple[str, str, bool, bool]]:
     return result
 
 
-def resolve_session_target(user_id: int, text: str) -> tuple[str, str, str, bool]:
+def resolve_session_target(user_id: int, text: str) -> tuple[str, str, str]:
     """Parse @session_name prefix from message text.
 
-    Returns (session_name, session_id, remaining_prompt, is_new).
+    Returns (session_name, local_session_id, remaining_prompt).
     If no @prefix, uses active session.
     If @name doesn't exist, auto-creates it.
     """
@@ -231,10 +243,8 @@ def resolve_session_target(user_id: int, text: str) -> tuple[str, str, str, bool
 
         sessions = user_all_sessions.get(user_id, {})
         if target_name in sessions:
-            # Existing session
             sid = sessions[target_name]
-            is_new = not session_initialized.get(sid, False)
-            return target_name, sid, prompt, is_new
+            return target_name, sid, prompt
         else:
             # Auto-create new session without switching active
             prev_active = user_active_session.get(user_id)
@@ -242,12 +252,12 @@ def resolve_session_target(user_id: int, text: str) -> tuple[str, str, str, bool
             if prev_active:
                 user_active_session[user_id] = prev_active
             log.info(f"Auto-created session '{name}' for @mention routing")
-            return name, sid, prompt, True
+            return name, sid, prompt
 
     # Default: use active session
-    sid, is_new = get_or_create_session(user_id)
+    sid = get_or_create_session(user_id)
     active_name = user_active_session.get(user_id, "?")
-    return active_name, sid, text, is_new
+    return active_name, sid, text
 
 
 # ─── Auth check ──────────────────────────────────────────────────────────────
@@ -259,7 +269,7 @@ def is_authorized(user_id: int) -> bool:
     return user_id in ALLOWED_USER_IDS
 
 
-# ─── Stream-JSON activity parsing ────────────────────────────────────────────
+# ─── Activity extraction from SDK messages ──────────────────────────────────
 
 # Tool name → user-friendly description
 TOOL_LABELS = {
@@ -270,297 +280,353 @@ TOOL_LABELS = {
     "Grep": "Searching",
     "Glob": "Finding files",
     "Task": "Running sub-agent",
+    "Agent": "Running sub-agent",
     "WebFetch": "Fetching web page",
     "WebSearch": "Searching web",
     "TodoWrite": "Updating tasks",
+    "AskUserQuestion": "Asking user",
 }
 
 
-def _format_activity(event: dict) -> Optional[str]:
-    """Extract user-friendly activity description from a stream-json event."""
-    if event.get("type") == "assistant":
-        msg = event.get("message", {})
-        for block in msg.get("content", []):
-            if block.get("type") == "tool_use":
-                tool_name = block.get("name", "")
-                label = TOOL_LABELS.get(tool_name, tool_name)
-                # Extract short context from input
-                inp = block.get("input", {})
-                if tool_name in ("Read", "Edit", "Write") and "file_path" in inp:
-                    path = inp["file_path"]
-                    short = path.split("/")[-1]  # just filename
-                    return f"{label} {short}"
-                elif tool_name == "Bash" and "command" in inp:
-                    cmd = inp["command"][:40]
-                    return f"{label}: {cmd}"
-                elif tool_name == "Grep" and "pattern" in inp:
-                    return f"{label} '{inp['pattern'][:30]}'"
-                elif tool_name == "Glob" and "pattern" in inp:
-                    return f"{label} {inp['pattern'][:30]}"
-                elif tool_name == "Task":
-                    desc = inp.get("description", "")[:30]
-                    return f"{label}: {desc}" if desc else label
-                return label
-            elif block.get("type") == "text":
-                text = block.get("text", "")
-                if text:
-                    return "Thinking..."
+def _extract_activity(msg) -> Optional[str]:
+    """Extract user-friendly activity description from an SDK message."""
+    if not isinstance(msg, AssistantMessage):
+        return None
+
+    for block in msg.content:
+        if isinstance(block, ToolUseBlock):
+            tool_name = block.name
+            label = TOOL_LABELS.get(tool_name, tool_name)
+            inp = block.input or {}
+            if tool_name in ("Read", "Edit", "Write") and "file_path" in inp:
+                path = inp["file_path"]
+                short = path.split("/")[-1]  # just filename
+                return f"{label} {short}"
+            elif tool_name == "Bash" and "command" in inp:
+                cmd = inp["command"][:40]
+                return f"{label}: {cmd}"
+            elif tool_name == "Grep" and "pattern" in inp:
+                return f"{label} '{inp['pattern'][:30]}'"
+            elif tool_name == "Glob" and "pattern" in inp:
+                return f"{label} {inp['pattern'][:30]}"
+            elif tool_name in ("Task", "Agent"):
+                desc = inp.get("description", "")[:30]
+                return f"{label}: {desc}" if desc else label
+            return label
+        elif isinstance(block, TextBlock):
+            text = block.text
+            if text:
+                return "Thinking..."
+
     return None
 
 
-# ─── Claude CLI interaction ──────────────────────────────────────────────────
+async def _update_thinking_msg(thinking_msg, activity_log: list[str],
+                               session_name: str, elapsed: float):
+    """Update the thinking message with current activity log (throttled by caller)."""
+    if not thinking_msg:
+        return
+    mins, secs = divmod(int(elapsed), 60)
+    time_str = f"{mins}m{secs:02d}s" if mins else f"{secs}s"
+    label = f"[{session_name}] " if session_name else ""
+    recent = activity_log[-10:]
+    log_text = "\n".join(f"  ▸ {a}" for a in recent)
+    if len(activity_log) > 10:
+        log_text = f"  ... ({len(activity_log) - 10} earlier)\n" + log_text
+    try:
+        await thinking_msg.edit_text(f"{label}Working... ({time_str})\n{log_text}")
+    except Exception:
+        pass
 
 
-async def call_claude(prompt: str, session_id: str, is_new: bool = True,
-                      thinking_msg=None, chat=None, session_name: str = "") -> tuple[str, list[str]]:
-    """Call claude CLI with stream-json output for real-time activity tracking.
+# ─── AskUserQuestion handling ───────────────────────────────────────────────
 
-    is_new: True = first message (use --session-id to create),
-            False = subsequent (use --resume to continue)
-    thinking_msg: the "Thinking..." message to update with activity
-    chat: the chat object for sending typing actions
+
+def _make_can_use_tool(chat, session_name: str):
+    """Create a can_use_tool callback that forwards AskUserQuestion to Telegram."""
+
+    async def can_use_tool(tool_name, tool_input, context):
+        if tool_name == "AskUserQuestion":
+            return await _handle_ask_user_question(tool_input, chat, session_name)
+        # Allow all other tools
+        return PermissionResultAllow(updated_input=tool_input)
+
+    return can_use_tool
+
+
+async def _handle_ask_user_question(tool_input: dict, chat, session_name: str):
+    """Forward AskUserQuestion to Telegram and wait for user response."""
+    questions = tool_input.get("questions", [])
+    if not questions:
+        return PermissionResultAllow(updated_input=tool_input)
+
+    answers = {}
+    label = f"[{session_name}] " if session_name else ""
+
+    for q in questions:
+        question_text = q.get("question", "")
+        header = q.get("header", "")
+        options = q.get("options", [])
+        multi_select = q.get("multiSelect", False)
+
+        # Generate unique question ID
+        qid = str(uuid.uuid4())[:8]
+
+        # Build message text
+        text_parts = [f"{label}Agent is asking:"]
+        if header:
+            text_parts.append(f"[{header}]")
+        text_parts.append(f"\n{question_text}\n")
+        for i, opt in enumerate(options):
+            desc = opt.get("description", "")
+            text_parts.append(f"  {i+1}. {opt['label']}" + (f" — {desc}" if desc else ""))
+
+        msg_text = "\n".join(text_parts)
+
+        # Build inline keyboard
+        keyboard = []
+        for i, opt in enumerate(options):
+            keyboard.append([InlineKeyboardButton(
+                opt["label"],
+                callback_data=f"ask:{qid}:{i}",
+            )])
+        # "Other" option - user types a reply
+        keyboard.append([InlineKeyboardButton(
+            "Other (type reply)",
+            callback_data=f"ask:{qid}:other",
+        )])
+        markup = InlineKeyboardMarkup(keyboard)
+
+        # Create future and register it
+        loop = asyncio.get_event_loop()
+        future = loop.create_future()
+        pending_questions[qid] = future
+        pending_question_options[qid] = options
+
+        try:
+            await chat.send_message(msg_text, reply_markup=markup)
+            log.info(f"AskUserQuestion forwarded to Telegram: qid={qid}, question={question_text[:50]}")
+
+            # Wait for user to answer (with timeout)
+            answer = await asyncio.wait_for(future, timeout=ASK_USER_TIMEOUT)
+            answers[question_text] = answer
+            log.info(f"AskUserQuestion answered: qid={qid}, answer={answer}")
+        except asyncio.TimeoutError:
+            # Timeout - auto-select first option
+            fallback = options[0]["label"] if options else "Yes"
+            answers[question_text] = fallback
+            log.warning(f"AskUserQuestion timeout: qid={qid}, auto-selected={fallback}")
+            try:
+                await chat.send_message(
+                    f"{label}No answer in {ASK_USER_TIMEOUT}s, auto-selected: {fallback}")
+            except Exception:
+                pass
+        finally:
+            pending_questions.pop(qid, None)
+            pending_question_options.pop(qid, None)
+
+    return PermissionResultAllow(
+        updated_input={"questions": questions, "answers": answers}
+    )
+
+
+async def handle_ask_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle inline keyboard button presses for AskUserQuestion."""
+    query = update.callback_query
+    if not query or not query.data or not query.data.startswith("ask:"):
+        return
+
+    parts = query.data.split(":", 2)
+    if len(parts) != 3:
+        await query.answer("Invalid callback data")
+        return
+
+    _, qid, choice = parts
+    future = pending_questions.get(qid)
+
+    if not future or future.done():
+        await query.answer("Question already answered or expired.")
+        return
+
+    if choice == "other":
+        # Mark that we're waiting for a text reply
+        # Store a special marker so handle_message can pick it up
+        await query.answer()
+        await query.message.reply_text(
+            "Type your answer as a reply to this message:")
+        # Store the qid in a way that handle_text_answer can find it
+        # We use a simple dict mapping chat_id to pending qid
+        _pending_text_answers[query.message.chat_id] = qid
+        return
+
+    # Regular option selection
+    try:
+        option_idx = int(choice)
+        options = pending_question_options.get(qid, [])
+        if 0 <= option_idx < len(options):
+            selected = options[option_idx]["label"]
+        else:
+            selected = choice
+    except ValueError:
+        selected = choice
+
+    future.set_result(selected)
+    await query.answer(f"Selected: {selected}")
+
+    # Update the message to show the selection
+    try:
+        await query.message.edit_text(
+            query.message.text + f"\n\n-> {selected}")
+    except Exception:
+        pass
+
+
+# Track pending "Other" text answers: chat_id -> qid
+_pending_text_answers: dict[int, str] = {}
+
+
+async def _check_text_answer(chat_id: int, text: str) -> bool:
+    """Check if a text message is an answer to a pending AskUserQuestion 'Other'.
+    Returns True if it was consumed as an answer."""
+    qid = _pending_text_answers.pop(chat_id, None)
+    if not qid:
+        return False
+
+    future = pending_questions.get(qid)
+    if future and not future.done():
+        future.set_result(text)
+        return True
+    return False
+
+
+# ─── Claude SDK interaction ─────────────────────────────────────────────────
+
+
+async def call_claude(prompt: str, session_id: str,
+                      thinking_msg=None, chat=None,
+                      session_name: str = "") -> tuple[str, list[str]]:
+    """Call Claude via Agent SDK with real-time activity tracking.
+
+    Uses ClaudeSDKClient for streaming mode (required for can_use_tool callback).
+    Session persistence via resume=sdk_session_id.
 
     Returns: (response_text, activity_log) tuple
     """
-    cmd = [
-        "claude",
-        "-p", prompt,
-        "--output-format", "stream-json",
-        "--verbose",
-        "--dangerously-skip-permissions",
-        "--max-turns", str(MAX_TURNS),
-    ]
+    # Build options
+    options = ClaudeAgentOptions(
+        cwd=WORK_DIR,
+        max_turns=MAX_TURNS,
+        permission_mode="bypassPermissions",
+        can_use_tool=_make_can_use_tool(chat, session_name) if chat else None,
+    )
 
-    if is_new:
-        cmd += ["--session-id", session_id]
-    else:
-        cmd += ["--resume", session_id]
+    # If we have a saved SDK session_id, resume it
+    sdk_sid = session_sdk_ids.get(session_id)
+    if sdk_sid:
+        options.resume = sdk_sid
 
-    log.info(f"Calling claude with session {session_id[:8]}... (is_new={is_new})")
+    log.info(f"Calling Claude SDK for session {session_id[:8]}... "
+             f"(resume={'yes' if sdk_sid else 'no'})")
 
-    env = os.environ.copy()
-    env.pop("CLAUDECODE", None)
+    client = ClaudeSDKClient(options=options)
+    session_clients[session_id] = client
 
     try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=WORK_DIR,
-            env=env,
-            limit=1024 * 1024,  # 1MB buffer limit (default 64KB too small for stream-json)
-        )
+        await client.connect()
+        await client.query(prompt)
 
-        # Register process for /kill command
-        session_processes[session_id] = proc
+        activity_log: list[str] = []
+        result_text = ""
+        actual_session_id = None
+        start_time = time.time()
+        last_edit_time = 0.0
+        last_heartbeat_time = start_time
+        EDIT_THROTTLE = 3.0
 
-        start_time = asyncio.get_event_loop().time()
-        last_event_time = start_time
-        current_activity = "Starting..."
-        activity_log = []  # Accumulated activity entries
-        last_edit_time = 0.0  # Throttle: last time we edited thinking_msg
-        EDIT_THROTTLE = 3.0  # Minimum seconds between edits
-        received_events = False  # Track if Claude started processing
-        stall_warned = False  # Only warn once per stall period
-        final_result = None
-        result_subtype = None
-        result_errors = []
-        result_num_turns = 0
-        # Track text per-turn: list of (turn_index, text) pairs
-        # Only the LAST assistant turn's text is the final response
-        last_assistant_text_parts = []
-        current_turn_text = []
+        async for msg in client.receive_response():
+            now = time.time()
+            elapsed = now - start_time
 
-        try:
-            while True:
-                now = asyncio.get_event_loop().time()
-                elapsed = int(now - start_time)
-                since_last_event = int(now - last_event_time)
+            # Total timeout check
+            if CLAUDE_TIMEOUT > 0 and elapsed >= CLAUDE_TIMEOUT:
+                log.error(f"Claude SDK timed out after {int(elapsed)}s")
+                try:
+                    await client.interrupt()
+                except Exception:
+                    pass
+                return (f"[Timeout] Total timeout ({CLAUDE_TIMEOUT}s) exceeded. "
+                        f"Use /kill to stop earlier."), activity_log
 
-                # Total timeout - only if explicitly configured (CLAUDE_TIMEOUT > 0)
-                # Default: no timeout, rely on --max-turns and /kill
-                if CLAUDE_TIMEOUT > 0 and elapsed >= CLAUDE_TIMEOUT:
-                    log.error(f"Claude CLI timed out after {elapsed}s")
-                    try:
-                        proc.kill()
-                    except Exception:
-                        pass
-                    if received_events and is_new:
-                        mark_session_initialized_by_sid(session_id)
-                    return f"[Timeout] Total timeout ({CLAUDE_TIMEOUT}s) exceeded. Use /kill to stop earlier.", activity_log
+            # Extract activity
+            activity = _extract_activity(msg)
+            if activity and (not activity_log or activity_log[-1] != activity):
+                activity_log.append(activity)
 
-                # Stall warning - warn user but do NOT kill
-                # (Long API calls produce no events, killing them is wrong)
-                if since_last_event >= STALL_WARN_TIMEOUT and not stall_warned:
-                    stall_warned = True
-                    log.warning(f"No events for {since_last_event}s, session {session_id[:8]} may be in long API call")
+            # Throttled update of thinking_msg
+            if thinking_msg and activity and (now - last_edit_time) >= EDIT_THROTTLE:
+                last_edit_time = now
+                await _update_thinking_msg(thinking_msg, activity_log,
+                                           session_name, elapsed)
+
+            # Heartbeat: send typing action periodically
+            if chat and (now - last_heartbeat_time) >= HEARTBEAT_INTERVAL:
+                last_heartbeat_time = now
+                try:
+                    await chat.send_action(ChatAction.TYPING)
+                except Exception:
+                    pass
+
+                # Stall warning
+                if not activity_log or (now - last_edit_time) >= STALL_WARN_TIMEOUT:
                     if thinking_msg:
-                        mins, secs = divmod(elapsed, 60)
+                        mins, secs = divmod(int(elapsed), 60)
                         time_str = f"{mins}m{secs:02d}s" if mins else f"{secs}s"
                         label = f"[{session_name}] " if session_name else ""
+                        last_act = activity_log[-1] if activity_log else "Starting..."
                         try:
                             await thinking_msg.edit_text(
-                                f"{label}Long thinking... no events for {since_last_event}s ({time_str})\n"
-                                f"Last: {current_activity}\n"
-                                f"Use /kill {session_name} if stuck"
-                            )
+                                f"{label}Long thinking... ({time_str})\n"
+                                f"Last: {last_act}\n"
+                                f"Use /kill {session_name} if stuck")
                         except Exception:
                             pass
 
-                # Try to read a line with heartbeat interval timeout
-                try:
-                    line = await asyncio.wait_for(
-                        proc.stdout.readline(), timeout=HEARTBEAT_INTERVAL
-                    )
-                except asyncio.TimeoutError:
-                    # No new line - send heartbeat with current activity
-                    if thinking_msg and not stall_warned:
-                        mins, secs = divmod(elapsed, 60)
-                        time_str = f"{mins}m{secs:02d}s" if mins else f"{secs}s"
-                        label = f"[{session_name}] " if session_name else ""
-                        recent = activity_log[-10:] if activity_log else [current_activity]
-                        log_text = "\n".join(f"  ▸ {a}" for a in recent)
-                        if len(activity_log) > 10:
-                            log_text = f"  ... ({len(activity_log) - 10} earlier)\n" + log_text
-                        try:
-                            await thinking_msg.edit_text(
-                                f"{label}Working... ({time_str})\n{log_text}"
-                            )
-                        except Exception:
-                            pass
-                    if chat:
-                        try:
-                            await chat.send_action(ChatAction.TYPING)
-                        except Exception:
-                            pass
-                    continue
+            # Capture result
+            if isinstance(msg, ResultMessage):
+                actual_session_id = msg.session_id
+                result_text = msg.result or ""
+                if msg.is_error:
+                    result_text = f"[Error] {result_text}"
+                if msg.subtype == "error_max_turns":
+                    result_text += (f"\n\n[Reached max turns ({msg.num_turns}). "
+                                    f"Task may be incomplete.]")
 
-                if not line:
-                    # EOF - process ended
-                    break
+        # Save SDK session_id for future resume
+        if actual_session_id:
+            session_sdk_ids[session_id] = actual_session_id
 
-                # Parse the JSON event
-                last_event_time = asyncio.get_event_loop().time()
-                try:
-                    event = json.loads(line.decode("utf-8", errors="replace"))
-                except json.JSONDecodeError:
-                    continue
+        return result_text or "[Task completed but no summary was produced.]", activity_log
 
-                received_events = True
-                stall_warned = False  # Reset: events are flowing again
-
-                # Extract activity for display
-                activity = _format_activity(event)
-                if activity:
-                    current_activity = activity
-                    # Append to log (avoid duplicate consecutive entries)
-                    if not activity_log or activity_log[-1] != activity:
-                        activity_log.append(activity)
-                    # Throttled update of thinking_msg
-                    now2 = asyncio.get_event_loop().time()
-                    if thinking_msg and (now2 - last_edit_time) >= EDIT_THROTTLE:
-                        last_edit_time = now2
-                        elapsed2 = int(now2 - start_time)
-                        mins, secs = divmod(elapsed2, 60)
-                        time_str = f"{mins}m{secs:02d}s" if mins else f"{secs}s"
-                        label = f"[{session_name}] " if session_name else ""
-                        # Show last N activities to keep message readable
-                        recent = activity_log[-10:]
-                        log_text = "\n".join(f"  ▸ {a}" for a in recent)
-                        if len(activity_log) > 10:
-                            log_text = f"  ... ({len(activity_log) - 10} earlier)\n" + log_text
-                        try:
-                            await thinking_msg.edit_text(
-                                f"{label}Working... ({time_str})\n{log_text}"
-                            )
-                        except Exception:
-                            pass
-
-                # Capture result
-                if event.get("type") == "result":
-                    final_result = event.get("result", "")
-                    result_subtype = event.get("subtype", "")
-                    result_errors = event.get("errors", [])
-                    result_num_turns = event.get("num_turns", 0)
-                elif event.get("type") == "assistant":
-                    has_text = False
-                    has_tool = False
-                    for block in event.get("message", {}).get("content", []):
-                        if block.get("type") == "text":
-                            text = block.get("text", "").strip()
-                            if text:
-                                current_turn_text.append(text)
-                                has_text = True
-                        elif block.get("type") == "tool_use":
-                            has_tool = True
-                    # When we see a tool_use, the current text is intermediate narration.
-                    # When we see text-only (no tool), it's likely a final response.
-                    if current_turn_text:
-                        if has_tool:
-                            current_turn_text = []
-                        else:
-                            last_assistant_text_parts = current_turn_text[:]
-                            current_turn_text = []
-                elif event.get("type") == "user":
-                    current_turn_text = []
-
-        finally:
-            # Clean up process tracking
-            session_processes.pop(session_id, None)
-
-            # Wait for process to finish
-            try:
-                await proc.wait()
-            except Exception:
-                pass
-
-        # Mark session as initialized if we received any events
-        if received_events and is_new:
-            mark_session_initialized_by_sid(session_id)
-
-        # --- Result extraction priority ---
-        # 1. result event's result field (best case: Claude provided final text)
-        if final_result:
-            return final_result, activity_log
-
-        # 2. Handle error subtypes from result event
-        if result_subtype and result_subtype != "success":
-            if result_subtype == "error_max_turns":
-                summary = "\n".join(last_assistant_text_parts) if last_assistant_text_parts else ""
-                warning = f"\n\n[Reached max turns ({result_num_turns}). Task may be incomplete.]"
-                result = (summary + warning) if summary else f"[Reached max turns ({result_num_turns}). No summary produced.]"
-                return result, activity_log
-            elif result_errors:
-                return f"[Error] {'; '.join(result_errors)}", activity_log
-
-        # 3. Last text-only assistant message (the actual conversational response)
-        if last_assistant_text_parts:
-            return "\n".join(last_assistant_text_parts), activity_log
-
-        # 4. If we have leftover current_turn_text (text that preceded the final tool call)
-        if current_turn_text:
-            return "\n".join(current_turn_text), activity_log
-
-        # 5. Fallback: read any remaining stderr
-        stderr = await proc.stderr.read()
-        err = stderr.decode("utf-8", errors="replace").strip()
-        if proc.returncode != 0 and err:
-            # Auto-retry: if "already in use" and we tried --session-id, retry with --resume
-            if is_new and "already in use" in err:
-                log.warning(f"Session {session_id[:8]} already exists on disk, retrying with --resume")
-                mark_session_initialized_by_sid(session_id)
-                return await call_claude(prompt, session_id, is_new=False,
-                                         thinking_msg=thinking_msg, chat=chat,
-                                         session_name=session_name)
-            return f"Error Claude CLI failed (code {proc.returncode}):\n{err}", activity_log
-
-        return "[Task completed but no summary was produced by Claude.]", activity_log
-
-    except FileNotFoundError:
-        return "Error claude CLI not found. Make sure it's in PATH.", []
+    except CLINotFoundError:
+        return "Error: claude CLI not found. Make sure it's installed.", []
+    except ProcessError as e:
+        error_msg = str(e)
+        # Handle "already in use" by retrying with resume
+        if "already in use" in error_msg and not sdk_sid:
+            log.warning(f"Session in use, retrying with resume for {session_id[:8]}")
+            # Try to find the SDK session_id from error context
+            # For now, just report the error
+            return f"Error: Session is already in use. Try /clear to reset.", []
+        return f"Error: {error_msg}", []
     except Exception as e:
-        log.exception("Unexpected error calling claude")
+        log.exception("Unexpected error calling Claude SDK")
         return f"Error {type(e).__name__}: {e}", []
+    finally:
+        session_clients.pop(session_id, None)
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
 
 
 # ─── Message splitting ───────────────────────────────────────────────────────
@@ -695,7 +761,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("Unauthorized.")
         return
 
-    session_id, _ = get_or_create_session(user_id)
+    session_id = get_or_create_session(user_id)
     active_name = user_active_session.get(user_id, "?")
     await update.message.reply_text(
         f"Claude Code Bot ready!\n\n"
@@ -808,8 +874,8 @@ async def cmd_sessions(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     lines = ["All sessions:"]
     for name, sid, is_active, is_busy in sessions:
         marker = " <- active" if is_active else ""
-        initialized = session_initialized.get(sid, False)
-        status = "BUSY" if is_busy else ("has context" if initialized else "empty")
+        has_context = sid in session_sdk_ids
+        status = "BUSY" if is_busy else ("has context" if has_context else "empty")
         lines.append(f"  `{name}` ({status}){marker}")
     lines.append(f"\nTotal: {len(sessions)}")
     lines.append("Use /switch <name> to switch, /new [name] to create.")
@@ -881,8 +947,8 @@ async def cmd_session(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     sessions = user_all_sessions.get(user_id, {})
     if active_name and active_name in sessions:
         sid = sessions[active_name]
-        initialized = session_initialized.get(sid, False)
-        status = "has context" if initialized else "empty"
+        has_context = sid in session_sdk_ids
+        status = "has context" if has_context else "empty"
         await update.message.reply_text(
             f"Current session: `{active_name}` ({status})\n"
             f"Session ID: `{sid}`\n"
@@ -895,7 +961,7 @@ async def cmd_session(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_kill(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /kill [session_name] - kill a running Claude process."""
+    """Handle /kill [session_name] - interrupt a running Claude session."""
     user_id = update.effective_user.id
     if not is_authorized(user_id):
         return
@@ -916,7 +982,7 @@ async def cmd_kill(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         # Show busy sessions as hint
         busy = []
         for name, sid in sessions.items():
-            if sid in session_processes:
+            if sid in session_clients:
                 busy.append(name)
         if busy:
             await update.message.reply_text(
@@ -929,20 +995,20 @@ async def cmd_kill(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     sid = sessions[target_name]
-    proc = session_processes.get(sid)
-    if not proc:
+    client = session_clients.get(sid)
+    if not client:
         await update.message.reply_text(f"Session `{target_name}` is not running.", parse_mode=ParseMode.MARKDOWN)
         return
 
     try:
-        proc.kill()
-        log.info(f"User killed session {target_name} ({sid[:8]})")
+        await client.interrupt()
+        log.info(f"User interrupted session {target_name} ({sid[:8]})")
         await update.message.reply_text(
-            f"Killed session `{target_name}`.",
+            f"Interrupted session `{target_name}`.",
             parse_mode=ParseMode.MARKDOWN,
         )
     except Exception as e:
-        await update.message.reply_text(f"Failed to kill: {e}")
+        await update.message.reply_text(f"Failed to interrupt: {e}")
 
 
 async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1002,7 +1068,7 @@ async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     caption = msg.caption or ""
     if caption:
         # Resolve session from caption FIRST (before prepending file path)
-        session_name, session_id, resolved_caption, is_new = resolve_session_target(user_id, caption)
+        session_name, session_id, resolved_caption = resolve_session_target(user_id, caption)
         prompt_text = f"File saved to: {save_path}\n\n{resolved_caption}"
         lock = get_session_lock(session_id)
 
@@ -1013,13 +1079,12 @@ async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
         async with lock:
             session_pending[session_id] = max(0, session_pending.get(session_id, 1) - 1)
-            is_new = not session_initialized.get(session_id, False)
 
             await msg.chat.send_action(ChatAction.TYPING)
             thinking_msg = await msg.reply_text(f"[{session_name}] Processing file + message...")
 
             response, activity_log = await call_claude(
-                prompt_text, session_id, is_new=is_new,
+                prompt_text, session_id,
                 thinking_msg=thinking_msg, chat=msg.chat,
                 session_name=session_name,
             )
@@ -1069,8 +1134,13 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
     if not text:
         return
 
+    # Check if this is a text answer to a pending AskUserQuestion "Other"
+    if await _check_text_answer(update.message.chat_id, text):
+        await update.message.reply_text("Answer received.")
+        return
+
     # Resolve target session: supports @session_name prefix
-    session_name, session_id, prompt, is_new = resolve_session_target(user_id, text)
+    session_name, session_id, prompt = resolve_session_target(user_id, text)
     lock = get_session_lock(session_id)
 
     # Track pending count per session
@@ -1087,24 +1157,18 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
     async with lock:
         session_pending[session_id] = max(0, session_pending.get(session_id, 1) - 1)
 
-        # Re-check is_new inside lock (may have changed while queued)
-        is_new = not session_initialized.get(session_id, False)
-
         # Send "typing" indicator
         await update.message.chat.send_action(ChatAction.TYPING)
 
         # Send a "working on it" message with session label
         thinking_msg = await update.message.reply_text(f"[{session_name}] Thinking...")
 
-        # Call Claude: first msg creates session, subsequent msgs resume it
+        # Call Claude
         response, activity_log = await call_claude(
-            prompt, session_id, is_new=is_new,
+            prompt, session_id,
             thinking_msg=thinking_msg, chat=update.message.chat,
             session_name=session_name,
         )
-
-        # Note: session initialization is now handled inside call_claude itself
-        # (marked as initialized once any events are received from Claude CLI)
 
         # Finalize the activity log message (keep it, don't delete)
         if thinking_msg:
@@ -1138,9 +1202,10 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
 
 
 def main():
-    log.info("Starting Claude Code Telegram Bot...")
+    log.info("Starting Claude Code Telegram Bot (Agent SDK)...")
     log.info(f"Working directory: {WORK_DIR}")
     log.info(f"Claude timeout: {CLAUDE_TIMEOUT}s")
+    log.info(f"AskUser timeout: {ASK_USER_TIMEOUT}s")
 
     if ALLOWED_USER_IDS:
         log.info(f"Allowed users: {ALLOWED_USER_IDS}")
@@ -1159,6 +1224,8 @@ def main():
     app.add_handler(CommandHandler("cd", cmd_cd))
     app.add_handler(CommandHandler("session", cmd_session))
     app.add_handler(CommandHandler("kill", cmd_kill))
+    # AskUserQuestion callback handler (must be before general message handler)
+    app.add_handler(CallbackQueryHandler(handle_ask_callback, pattern=r"^ask:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(
         filters.Document.ALL | filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.VOICE | filters.VIDEO_NOTE,
