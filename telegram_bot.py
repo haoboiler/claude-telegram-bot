@@ -101,6 +101,11 @@ os.makedirs(UPLOAD_DIR, exist_ok=True)
 # Telegram message max length
 TG_MAX_LEN = 4000
 
+# Memory-notebook auto-sync script path
+AUTO_SYNC_SCRIPT = os.path.expanduser(
+    "~/.claude/skills/memory-notebook/scripts/auto-sync.sh"
+)
+
 # ─── Logging ─────────────────────────────────────────────────────────────────
 
 logging.basicConfig(
@@ -133,6 +138,21 @@ session_clients: dict[str, ClaudeSDKClient] = {}
 # Auto-increment session counter per user for default naming
 user_session_counter: dict[int, int] = {}
 
+# Per-session working directory: local_session_id -> cwd path
+session_work_dirs: dict[str, str] = {}
+
+# Project shortname -> full path mapping
+PROJECT_SHORTCUTS: dict[str, str] = {
+    "tgcc": "/home/gkh/claude_tasks/claude-telegram-bot",
+    "ashare": "/home/gkh/ashare",
+    "casimir_ashare": "/home/gkh/ashare/casimir_ashare",
+    "bookmodel": "/home/gkh/claude_tasks/bookmodel_slippage",
+    "bookmodel_slippage": "/home/gkh/claude_tasks/bookmodel_slippage",
+    "revenue": "/home/gkh/revenue",
+    "rena": "/home/gkh/revenue",
+    "tmp": "/home/gkh/claude_tasks/tmp_task",
+}
+
 # Pending AskUserQuestion futures: question_id -> asyncio.Future
 pending_questions: dict[str, asyncio.Future] = {}
 # question_id -> list of original options (for resolving callback index)
@@ -153,6 +173,33 @@ def _next_default_name(user_id: int) -> str:
     return f"s{cnt}"
 
 
+def resolve_cwd(cwd_arg: Optional[str]) -> Optional[str]:
+    """Resolve a cwd argument to an absolute path.
+
+    Accepts: project shortname (e.g. 'casimir_ashare'), ~ path, absolute path,
+    or relative path (resolved against global WORK_DIR).
+    Returns absolute path if valid directory, None otherwise.
+    """
+    if not cwd_arg:
+        return None
+
+    # Check project shortcuts first
+    if cwd_arg in PROJECT_SHORTCUTS:
+        path = PROJECT_SHORTCUTS[cwd_arg]
+    else:
+        path = os.path.expanduser(cwd_arg)
+        if not os.path.isabs(path):
+            path = os.path.join(WORK_DIR, path)
+        path = os.path.abspath(path)
+
+    return path if os.path.isdir(path) else None
+
+
+def get_session_cwd(session_id: str) -> str:
+    """Get the working directory for a session (falls back to global WORK_DIR)."""
+    return session_work_dirs.get(session_id, WORK_DIR)
+
+
 def get_or_create_session(user_id: int) -> str:
     """Get existing session or create a new one. Returns local_session_id."""
     if user_id not in user_all_sessions:
@@ -171,8 +218,14 @@ def get_or_create_session(user_id: int) -> str:
     return sid
 
 
-def create_new_session(user_id: int, name: Optional[str] = None) -> tuple[str, str]:
-    """Create a new session and switch to it. Returns (name, local_session_id)."""
+def create_new_session(user_id: int, name: Optional[str] = None,
+                       cwd: Optional[str] = None) -> tuple[str, str]:
+    """Create a new session and switch to it. Returns (name, local_session_id).
+
+    Args:
+        cwd: Optional per-session working directory (absolute path, already resolved).
+             If None, inherits global WORK_DIR at call time.
+    """
     if user_id not in user_all_sessions:
         user_all_sessions[user_id] = {}
 
@@ -190,7 +243,13 @@ def create_new_session(user_id: int, name: Optional[str] = None) -> tuple[str, s
     sid = str(uuid.uuid4())
     user_all_sessions[user_id][name] = sid
     user_active_session[user_id] = name
-    log.info(f"Created session for user {user_id}: {name} ({sid})")
+
+    # Store per-session cwd (if provided, otherwise get_session_cwd falls back to WORK_DIR)
+    if cwd:
+        session_work_dirs[sid] = cwd
+
+    log.info(f"Created session for user {user_id}: {name} ({sid})"
+             f"{f' cwd={cwd}' if cwd else ''}")
     return name, sid
 
 
@@ -204,13 +263,51 @@ def switch_session(user_id: int, name: str) -> Optional[str]:
     return sessions[name]
 
 
-def clear_session(user_id: int) -> str:
-    """Clear current session and create a new one (replaces current slot)."""
+def clear_session(user_id: int, target_name: str | None = None) -> tuple[str, str, str | None]:
+    """Clear a session's context and start fresh.
+
+    Args:
+        target_name: Session name to clear. If None, clears the active session.
+
+    When target_name is None (clear active):
+        Destroys current session, creates a new auto-named one, switches to it.
+    When target_name is given:
+        Resets the named session (new ID, preserves name and cwd).
+        Does NOT change the active session.
+
+    Returns: (new_session_name, new_sid, old_cwd).
+    """
+    sessions = user_all_sessions.get(user_id, {})
+
+    if target_name and target_name in sessions:
+        # Clear a specific named session: keep name and cwd, reset context
+        old_sid = sessions[target_name]
+        old_cwd = session_work_dirs.get(old_sid)
+        session_sdk_ids.pop(old_sid, None)
+        session_work_dirs.pop(old_sid, None)
+        session_locks.pop(old_sid, None)
+        session_pending.pop(old_sid, None)
+        session_clients.pop(old_sid, None)
+
+        new_sid = str(uuid.uuid4())
+        sessions[target_name] = new_sid
+        if old_cwd:
+            session_work_dirs[new_sid] = old_cwd
+        log.info(f"Session '{target_name}' cleared for user {user_id}, "
+                 f"new sid: {new_sid} (kept name and cwd={old_cwd})")
+        return target_name, new_sid, old_cwd
+
+    # Clear active session (original behavior): destroy and create new auto-named
     old_name = user_active_session.get(user_id)
-    if old_name and user_id in user_all_sessions:
-        old_sid = user_all_sessions[user_id].pop(old_name, None)
-        if old_sid:
-            session_sdk_ids.pop(old_sid, None)
+    old_cwd = None
+    if old_name and old_name in sessions:
+        old_sid = sessions.pop(old_name)
+        old_cwd = session_work_dirs.get(old_sid)
+        session_sdk_ids.pop(old_sid, None)
+        session_work_dirs.pop(old_sid, None)
+        session_locks.pop(old_sid, None)
+        session_pending.pop(old_sid, None)
+        session_clients.pop(old_sid, None)
 
     name = _next_default_name(user_id)
     sid = str(uuid.uuid4())
@@ -219,7 +316,77 @@ def clear_session(user_id: int) -> str:
     user_all_sessions[user_id][name] = sid
     user_active_session[user_id] = name
     log.info(f"Session cleared for user {user_id}, new: {name} ({sid})")
-    return sid
+    return name, sid, old_cwd
+
+
+def delete_session(user_id: int, name: str) -> tuple[bool, str, str | None]:
+    """Delete a specific session by name. Returns (success, message, deleted_cwd)."""
+    sessions = user_all_sessions.get(user_id, {})
+    if name not in sessions:
+        return False, f"Session `{name}` not found.", None
+
+    sid = sessions[name]
+
+    # Refuse to delete a busy session
+    lock = session_locks.get(sid)
+    if lock and lock.locked():
+        return False, f"Session `{name}` is busy. Use /kill first.", None
+
+    # Capture cwd before cleanup
+    deleted_cwd = get_session_cwd(sid)
+
+    # Clean up all data structures
+    sessions.pop(name)
+    session_sdk_ids.pop(sid, None)
+    session_work_dirs.pop(sid, None)
+    session_locks.pop(sid, None)
+    session_pending.pop(sid, None)
+    session_clients.pop(sid, None)
+
+    # If deleted the active session, switch to another or create new
+    if user_active_session.get(user_id) == name:
+        if sessions:
+            new_active = next(iter(sessions))
+            user_active_session[user_id] = new_active
+        else:
+            new_name = _next_default_name(user_id)
+            new_sid = str(uuid.uuid4())
+            sessions[new_name] = new_sid
+            user_active_session[user_id] = new_name
+
+    log.info(f"Deleted session '{name}' ({sid[:8]}) for user {user_id}")
+    return True, f"Session `{name}` deleted.", deleted_cwd
+
+
+async def run_auto_sync(cwd: str) -> str:
+    """Run memory-notebook auto-sync in the given cwd. Returns status message."""
+    if not os.path.isfile(AUTO_SYNC_SCRIPT):
+        return "sync script not found"
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "bash", AUTO_SYNC_SCRIPT,
+            cwd=cwd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+        if proc.returncode == 0:
+            log.info(f"Auto-sync completed (cwd={cwd})")
+            return "synced"
+        else:
+            err = stderr.decode().strip()
+            log.warning(f"Auto-sync exited {proc.returncode}: {err}")
+            return f"sync error (exit {proc.returncode})"
+    except asyncio.TimeoutError:
+        log.warning(f"Auto-sync timed out (cwd={cwd})")
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        return "sync timed out"
+    except Exception as e:
+        log.exception(f"Auto-sync failed: {e}")
+        return f"sync failed: {e}"
 
 
 def list_sessions(user_id: int) -> list[tuple[str, str, bool, bool]]:
@@ -239,7 +406,7 @@ def resolve_session_target(user_id: int, text: str) -> tuple[str, str, str]:
 
     Returns (session_name, local_session_id, remaining_prompt).
     If no @prefix, uses active session.
-    If @name doesn't exist, auto-creates it.
+    If @name doesn't exist, auto-creates it (inherits active session's cwd).
     """
     if text.startswith("@") and " " in text:
         target_name, prompt = text.split(" ", 1)
@@ -251,11 +418,17 @@ def resolve_session_target(user_id: int, text: str) -> tuple[str, str, str]:
             return target_name, sid, prompt
         else:
             # Auto-create new session without switching active
+            # Inherit cwd from active session
             prev_active = user_active_session.get(user_id)
-            name, sid = create_new_session(user_id, target_name)
+            inherit_cwd = None
+            if prev_active and prev_active in sessions:
+                active_sid = sessions[prev_active]
+                inherit_cwd = session_work_dirs.get(active_sid)
+            name, sid = create_new_session(user_id, target_name, cwd=inherit_cwd)
             if prev_active:
                 user_active_session[user_id] = prev_active
-            log.info(f"Auto-created session '{name}' for @mention routing")
+            log.info(f"Auto-created session '{name}' for @mention routing"
+                     f"{f' (inherited cwd={inherit_cwd})' if inherit_cwd else ''}")
             return name, sid, prompt
 
     # Default: use active session
@@ -516,9 +689,10 @@ async def call_claude(prompt: str, session_id: str,
 
     Returns: (response_text, activity_log) tuple
     """
-    # Build options
+    # Build options (use per-session cwd if set, otherwise global WORK_DIR)
+    effective_cwd = get_session_cwd(session_id)
     options = ClaudeAgentOptions(
-        cwd=WORK_DIR,
+        cwd=effective_cwd,
         max_turns=MAX_TURNS,
         permission_mode="bypassPermissions",
         can_use_tool=_make_can_use_tool(chat, session_name) if chat else None,
@@ -531,7 +705,7 @@ async def call_claude(prompt: str, session_id: str,
         options.resume = sdk_sid
 
     log.info(f"Calling Claude SDK for session {session_id[:8]}... "
-             f"(resume={'yes' if sdk_sid else 'no'})")
+             f"(resume={'yes' if sdk_sid else 'no'}, cwd={effective_cwd})")
 
     client = ClaudeSDKClient(options=options)
     session_clients[session_id] = client
@@ -774,46 +948,207 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         f"Session: `{active_name}` (`{session_id[:8]}...`)\n"
         f"Working dir: `{WORK_DIR}`\n\n"
         f"Commands:\n"
-        f"/new [name] - New session (keeps old)\n"
+        f"/new [name] [cwd] - New session (keeps old)\n"
         f"/switch <name> - Switch session\n"
         f"/sessions - List all sessions\n"
-        f"/clear - Reset current session\n"
+        f"/clear [name] - Reset session context\n"
+        f"/delete <name> - Delete a session\n"
         f"/status - Bot status\n"
-        f"/cd <path> - Change working dir\n"
+        f"/cd [path|shortname] - Change session cwd\n"
         f"/session - Current session info\n"
-        f"/kill [name] - Kill stuck session\n\n"
+        f"/kill [name] - Kill stuck session\n"
+        f"/sync - Sync memory notebook\n\n"
         f"Send any message to interact with Claude.\n"
         f"Use `@name msg` to send to a specific session.\n"
-        f"Different sessions run in parallel!",
+        f"Different sessions run in parallel!\n\n"
+        f"Per-session cwd: use `/new build casimir_ashare`\n"
+        f"to create a session bound to a project.",
         parse_mode=ParseMode.MARKDOWN,
     )
 
 
 async def cmd_clear(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /clear - reset current conversation (destroys current session, creates new one)."""
+    """Handle /clear [name] - reset a session's conversation context.
+
+    Usage:
+        /clear           - clear active session (destroys it, creates new auto-named)
+        /clear casimir   - clear named session (keeps name and cwd, resets context)
+    """
     user_id = update.effective_user.id
     if not is_authorized(user_id):
         return
 
-    new_session = clear_session(user_id)
+    target_name = ctx.args[0] if ctx.args else None
+
+    # Validate target exists
+    if target_name:
+        sessions = user_all_sessions.get(user_id, {})
+        if target_name not in sessions:
+            available = ", ".join(f"`{n}`" for n in sorted(sessions.keys()))
+            await update.message.reply_text(
+                f"Session `{target_name}` not found.\n"
+                f"Available: {available or 'none'}",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+
+    cleared_name, new_sid, old_cwd = clear_session(user_id, target_name)
+
+    if target_name:
+        # Named clear: kept name, reset context
+        home = os.path.expanduser("~")
+        cwd_display = get_session_cwd(new_sid).replace(home, "~")
+        reply = (
+            f"Session `{cleared_name}` cleared (context reset).\n"
+            f"📁 cwd: `{cwd_display}` (preserved)"
+        )
+    else:
+        # Active session clear (original behavior)
+        reply = (
+            f"Conversation cleared.\n"
+            f"New session: `{cleared_name}` (`{new_sid[:8]}...`)"
+        )
+
+    msg = await update.message.reply_text(reply, parse_mode=ParseMode.MARKDOWN)
+
+    # Auto-sync memory notebook from the old session's cwd
+    if old_cwd:
+        sync_status = await run_auto_sync(old_cwd)
+        if sync_status == "synced":
+            try:
+                await msg.edit_text(
+                    reply + "\n📓 Memory notebook synced.",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+            except Exception:
+                pass
+
+
+async def cmd_delete(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /delete <name> - delete a specific session."""
+    user_id = update.effective_user.id
+    if not is_authorized(user_id):
+        return
+
+    if not ctx.args:
+        await update.message.reply_text(
+            "Usage: `/delete <session_name>`\n"
+            "Use /sessions to see all sessions.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    target_name = ctx.args[0]
+    success, message, deleted_cwd = delete_session(user_id, target_name)
+
+    if not success:
+        await update.message.reply_text(message, parse_mode=ParseMode.MARKDOWN)
+        return
+
+    # Show new active session info
     active_name = user_active_session.get(user_id, "?")
-    await update.message.reply_text(
-        f"Conversation cleared.\n"
-        f"New session: `{active_name}` (`{new_session[:8]}...`)",
+    remaining = len(user_all_sessions.get(user_id, {}))
+    reply = f"{message}\nActive: `{active_name}` | Total: {remaining}"
+    msg = await update.message.reply_text(reply, parse_mode=ParseMode.MARKDOWN)
+
+    # Auto-sync memory notebook from the deleted session's cwd
+    if deleted_cwd:
+        sync_status = await run_auto_sync(deleted_cwd)
+        if sync_status == "synced":
+            try:
+                await msg.edit_text(
+                    reply + "\n📓 Memory notebook synced.",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+            except Exception:
+                pass
+
+
+async def cmd_sync(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /sync - manually trigger memory notebook sync."""
+    user_id = update.effective_user.id
+    if not is_authorized(user_id):
+        return
+
+    # Use active session's cwd for project detection
+    active_name = user_active_session.get(user_id)
+    sessions = user_all_sessions.get(user_id, {})
+    if active_name and active_name in sessions:
+        sid = sessions[active_name]
+        cwd = get_session_cwd(sid)
+    else:
+        cwd = WORK_DIR
+
+    home = os.path.expanduser("~")
+    display_cwd = cwd.replace(home, "~")
+    msg = await update.message.reply_text(
+        f"📓 Syncing memory notebook...\n(project: `{display_cwd}`)",
         parse_mode=ParseMode.MARKDOWN,
     )
 
+    sync_status = await run_auto_sync(cwd)
+
+    status_map = {
+        "synced": "📓 Memory notebook synced.",
+        "sync script not found": "❌ Sync script not found.",
+    }
+    status_text = status_map.get(sync_status, f"⚠️ Sync: {sync_status}")
+
+    try:
+        await msg.edit_text(
+            f"{status_text}\n(project: `{display_cwd}`)",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    except Exception:
+        await update.message.reply_text(status_text)
+
 
 async def cmd_new(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /new [name] - create a new session and switch to it (old session preserved)."""
+    """Handle /new [name] [cwd] - create a new session and switch to it.
+
+    Usage:
+        /new                     - auto-named, uses global WORK_DIR
+        /new build               - named 'build', uses global WORK_DIR
+        /new build casimir_ashare - named 'build', cwd = project shortname
+        /new build ~/ashare      - named 'build', cwd = expanded path
+    """
     user_id = update.effective_user.id
     if not is_authorized(user_id):
         return
 
-    name = " ".join(ctx.args) if ctx.args else None
-    new_name, new_sid = create_new_session(user_id, name)
+    name = None
+    cwd = None
+
+    if ctx.args:
+        name = ctx.args[0]
+        if len(ctx.args) >= 2:
+            # Second arg onwards is cwd (join in case path has spaces, though unlikely)
+            cwd_arg = " ".join(ctx.args[1:])
+            resolved = resolve_cwd(cwd_arg)
+            if resolved:
+                cwd = resolved
+            else:
+                # Check if it looks like a shortname typo
+                available = ", ".join(f"`{k}`" for k in sorted(PROJECT_SHORTCUTS.keys()))
+                await update.message.reply_text(
+                    f"⚠️ Directory not found: `{cwd_arg}`\n\n"
+                    f"Available shortcuts: {available}\n"
+                    f"Or use an absolute/relative path.",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+                return
+
+    new_name, new_sid = create_new_session(user_id, name, cwd=cwd)
+    effective = get_session_cwd(new_sid)
+    # Show shortened path for display
+    display_cwd = effective.replace(os.path.expanduser("~"), "~")
+    cwd_note = ""
+    if cwd:
+        cwd_arg = " ".join(ctx.args[1:])
+        cwd_note = " (shortcut)" if cwd_arg in PROJECT_SHORTCUTS else ""
     await update.message.reply_text(
-        f"New session created: `{new_name}` (`{new_sid[:8]}...`)\n"
+        f"✅ New session: `{new_name}` (`{new_sid[:8]}...`)\n"
+        f"📁 cwd: `{display_cwd}`{cwd_note}\n\n"
         f"Use /sessions to see all sessions.\n"
         f"Use /switch <name> to switch back.",
         parse_mode=ParseMode.MARKDOWN,
@@ -876,14 +1211,25 @@ async def cmd_sessions(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("No sessions yet. Send a message to start one.")
         return
 
+    home = os.path.expanduser("~")
     lines = ["All sessions:"]
     for name, sid, is_active, is_busy in sessions:
         marker = " <- active" if is_active else ""
         has_context = sid in session_sdk_ids
         status = "BUSY" if is_busy else ("has context" if has_context else "empty")
-        lines.append(f"  `{name}` ({status}){marker}")
+        s_cwd = get_session_cwd(sid).replace(home, "~")
+        lines.append(f"  `{name}` ({status}){marker}\n    📁 `{s_cwd}`")
     lines.append(f"\nTotal: {len(sessions)}")
-    lines.append("Use /switch <name> to switch, /new [name] to create.")
+    lines.append(
+        "\nQuick reference:\n"
+        "  /switch <name> - Switch to session\n"
+        "  /new [name] [cwd] - Create new session\n"
+        "  /delete <name> - Delete a session\n"
+        "  /clear [name] - Reset session context\n"
+        "  /cd [path] - Change session cwd\n"
+        "  /kill [name] - Kill busy session\n"
+        "  /sync - Sync memory notebook"
+    )
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
 
@@ -901,14 +1247,19 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if lock and lock.locked():
             busy_sessions.append(name)
 
+    home = os.path.expanduser("~")
+    active_sid = sessions.get(active_name)
+    active_cwd = get_session_cwd(active_sid).replace(home, "~") if active_sid else "N/A"
+    global_cwd = WORK_DIR.replace(home, "~")
     await update.message.reply_text(
         f"Bot Status:\n"
         f"- Running: yes\n"
         f"- User ID: `{user_id}`\n"
         f"- Active session: `{active_name}`\n"
+        f"- Session cwd: `{active_cwd}`\n"
+        f"- Global default cwd: `{global_cwd}`\n"
         f"- Total sessions: {len(sessions)}\n"
         f"- Busy sessions: {', '.join(f'`{n}`' for n in busy_sessions) if busy_sessions else 'none'}\n"
-        f"- Work dir: `{WORK_DIR}`\n"
         f"- Timeout: {CLAUDE_TIMEOUT}s\n"
         f"- Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
         parse_mode=ParseMode.MARKDOWN,
@@ -916,30 +1267,83 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_cd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /cd - change working directory."""
+    """Handle /cd [path|shortname] - change working directory for current session.
+
+    Usage:
+        /cd                      - show current session's cwd
+        /cd casimir_ashare       - change to project shortname
+        /cd ~/ashare             - change to expanded path
+        /cd --global <path>      - change global default WORK_DIR (affects new sessions)
+    """
     global WORK_DIR
     user_id = update.effective_user.id
     if not is_authorized(user_id):
         return
 
+    # Get current active session
+    active_name = user_active_session.get(user_id)
+    sessions = user_all_sessions.get(user_id, {})
+    active_sid = sessions.get(active_name) if active_name else None
+    home = os.path.expanduser("~")
+
     if not ctx.args:
-        await update.message.reply_text(f"Current: `{WORK_DIR}`", parse_mode=ParseMode.MARKDOWN)
+        if active_sid:
+            s_cwd = get_session_cwd(active_sid).replace(home, "~")
+            is_custom = active_sid in session_work_dirs
+            global_cwd = WORK_DIR.replace(home, "~")
+            msg = f"Session `{active_name}` cwd: `{s_cwd}`"
+            if is_custom:
+                msg += f"\nGlobal default: `{global_cwd}`"
+        else:
+            msg = f"Global cwd: `{WORK_DIR.replace(home, '~')}`"
+        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
         return
 
-    new_dir = " ".join(ctx.args)
-    new_dir = os.path.expanduser(new_dir)
-    if not os.path.isabs(new_dir):
-        new_dir = os.path.join(WORK_DIR, new_dir)
-    new_dir = os.path.abspath(new_dir)
+    # Check --global flag
+    args = list(ctx.args)
+    is_global = False
+    if args[0] == "--global":
+        is_global = True
+        args = args[1:]
+        if not args:
+            await update.message.reply_text(
+                f"Global default: `{WORK_DIR.replace(home, '~')}`\n"
+                f"Usage: /cd --global <path|shortname>",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
 
-    if os.path.isdir(new_dir):
-        WORK_DIR = new_dir
+    cwd_arg = " ".join(args)
+    resolved = resolve_cwd(cwd_arg)
+
+    if not resolved:
+        available = ", ".join(f"`{k}`" for k in sorted(PROJECT_SHORTCUTS.keys()))
         await update.message.reply_text(
-            f"Working directory changed to:\n`{WORK_DIR}`",
+            f"Directory not found: `{cwd_arg}`\n\n"
+            f"Available shortcuts: {available}",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    display = resolved.replace(home, "~")
+    shortcut_note = " (shortcut)" if cwd_arg in PROJECT_SHORTCUTS else ""
+
+    if is_global:
+        WORK_DIR = resolved
+        await update.message.reply_text(
+            f"Global default changed to:\n`{display}`{shortcut_note}\n"
+            f"(Affects new sessions without custom cwd)",
             parse_mode=ParseMode.MARKDOWN,
         )
     else:
-        await update.message.reply_text(f"Directory not found: `{new_dir}`", parse_mode=ParseMode.MARKDOWN)
+        if not active_sid:
+            await update.message.reply_text("No active session. Send a message to create one first.")
+            return
+        session_work_dirs[active_sid] = resolved
+        await update.message.reply_text(
+            f"Session `{active_name}` cwd changed to:\n`{display}`{shortcut_note}",
+            parse_mode=ParseMode.MARKDOWN,
+        )
 
 
 async def cmd_session(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -954,10 +1358,14 @@ async def cmd_session(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         sid = sessions[active_name]
         has_context = sid in session_sdk_ids
         status = "has context" if has_context else "empty"
+        home = os.path.expanduser("~")
+        s_cwd = get_session_cwd(sid).replace(home, "~")
+        is_custom = sid in session_work_dirs
+        cwd_label = f"`{s_cwd}`" + (" (custom)" if is_custom else " (global)")
         await update.message.reply_text(
             f"Current session: `{active_name}` ({status})\n"
             f"Session ID: `{sid}`\n"
-            f"Work dir: `{WORK_DIR}`\n"
+            f"Work dir: {cwd_label}\n"
             f"Total sessions: {len(sessions)}",
             parse_mode=ParseMode.MARKDOWN,
         )
@@ -1128,14 +1536,47 @@ async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
 
+# CLI built-in commands that don't work through the SDK.
+# Map to natural language rewrites where possible, None = unsupported.
+CLI_BUILTIN_REWRITES: dict[str, str | None] = {
+    "skills": "List all your available skills with a brief description of each.",
+    "help": None,
+    "config": None,
+    "login": None,
+    "logout": None,
+    "doctor": None,
+    "compact": None,
+    "model": None,
+    "permissions": None,
+    "cost": None,
+}
+
+
 async def handle_unknown_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Forward unrecognized /commands to Claude as skill invocations.
 
     Claude agent has a Skill tool that can execute skills like /memo, /commit, etc.
     Bot-specific commands (/start, /kill, etc.) are handled by their own handlers
     and never reach here.
+
+    CLI built-in commands (/skills, /help, etc.) are intercepted and either
+    rewritten to natural language or rejected with a message.
     """
-    # Reuse handle_message logic with the full command text (including the /)
+    text = update.message.text or ""
+    # Extract command name (e.g. "/skills" -> "skills", "/skills@botname" -> "skills")
+    cmd = text.split()[0].lstrip("/").split("@")[0].lower() if text else ""
+
+    if cmd in CLI_BUILTIN_REWRITES:
+        rewrite = CLI_BUILTIN_REWRITES[cmd]
+        if rewrite is None:
+            await update.message.reply_text(
+                f"/{cmd} is a CLI-only command and not available via Telegram.",
+            )
+            return
+        # Replace the original command text with the rewritten prompt
+        update.message.text = rewrite
+
+    # Forward to Claude (either original /skill command or rewritten prompt)
     await handle_message(update, ctx)
 
 
@@ -1240,6 +1681,8 @@ def main():
     app.add_handler(CommandHandler("cd", cmd_cd))
     app.add_handler(CommandHandler("session", cmd_session))
     app.add_handler(CommandHandler("kill", cmd_kill))
+    app.add_handler(CommandHandler("delete", cmd_delete))
+    app.add_handler(CommandHandler("sync", cmd_sync))
     # AskUserQuestion callback handler (must be before general message handler)
     app.add_handler(CallbackQueryHandler(handle_ask_callback, pattern=r"^ask:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
