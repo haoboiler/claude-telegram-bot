@@ -790,11 +790,23 @@ async def call_claude(prompt: str, session_id: str,
         return "Error: claude CLI not found. Make sure it's installed.", []
     except ProcessError as e:
         error_msg = str(e)
-        # Handle "already in use" by retrying with resume
-        if "already in use" in error_msg and not sdk_sid:
-            log.warning(f"Session in use, retrying with resume for {session_id[:8]}")
-            # Try to find the SDK session_id from error context
-            # For now, just report the error
+        log.error(f"ProcessError for session {session_id[:8]}: {error_msg} "
+                  f"(was_resume={bool(sdk_sid)})")
+
+        # If resume failed, clear the stored sdk_sid and retry without resume
+        if sdk_sid:
+            log.warning(f"Resume failed for {session_id[:8]}, clearing sdk_sid "
+                        f"and retrying without resume")
+            session_sdk_ids.pop(session_id, None)
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
+            session_clients.pop(session_id, None)
+            # Retry without resume (recursive, but only once since sdk_sid is now cleared)
+            return await call_claude(prompt, session_id, chat, thinking_msg, session_name)
+
+        if "already in use" in error_msg:
             return f"Error: Session is already in use. Try /clear to reset.", []
         return f"Error: {error_msg}", []
     except Exception as e:
