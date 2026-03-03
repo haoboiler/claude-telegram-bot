@@ -25,8 +25,9 @@ start_instance() {
         fi
     fi
 
-    # Start bot
-    nohup python3 "$SCRIPT_DIR/telegram_bot.py" --instance "$name" \
+    # Start bot (use py11 conda env which has all dependencies)
+    local PYTHON="/home/b0qi/anaconda3/envs/py11/bin/python"
+    nohup "$PYTHON" "$SCRIPT_DIR/telegram_bot.py" --instance "$name" \
         > "$LOGS_DIR/${name}.log" 2>&1 &
     local pid=$!
     echo "$pid" > "$pid_file"

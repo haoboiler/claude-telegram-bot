@@ -106,6 +106,30 @@ AUTO_SYNC_SCRIPT = os.path.expanduser(
     "~/.claude/skills/memory-notebook/scripts/auto-sync.sh"
 )
 
+# ─── Group Mode Configuration ────────────────────────────────────────────────
+
+# Bot owner's Telegram user ID (required for group mode)
+# If not set, derives from the first entry in TELEGRAM_ALLOWED_USERS
+OWNER_USER_ID: int | None = None
+_owner_env = os.environ.get("TELEGRAM_OWNER_ID", "")
+if _owner_env:
+    OWNER_USER_ID = int(_owner_env.strip())
+elif ALLOWED_USER_IDS:
+    OWNER_USER_ID = next(iter(ALLOWED_USER_IDS))
+
+# Bot's own username (set dynamically at startup via getMe)
+BOT_USERNAME: str = ""
+
+# Shared directory for bot-to-bot communication (all bots on same server)
+# Structure: {SHARED_DIR}/requests/{id}.json, {SHARED_DIR}/discussions/{id}/...
+SHARED_DIR = os.environ.get("GROUP_SHARED_DIR", "")
+if SHARED_DIR:
+    os.makedirs(os.path.join(SHARED_DIR, "requests"), exist_ok=True)
+    os.makedirs(os.path.join(SHARED_DIR, "discussions"), exist_ok=True)
+
+# Polling interval for checking shared directory (seconds)
+SHARED_POLL_INTERVAL = float(os.environ.get("GROUP_POLL_INTERVAL", "2.0"))
+
 # ─── Logging ─────────────────────────────────────────────────────────────────
 
 logging.basicConfig(
@@ -496,6 +520,178 @@ def is_authorized(user_id: int) -> bool:
     if not ALLOWED_USER_IDS:
         return True  # No restriction if not configured
     return user_id in ALLOWED_USER_IDS
+
+
+# ─── Group chat awareness ───────────────────────────────────────────────────
+
+# Track which group chats have already received the Privacy Mode reminder
+# (per chat_id, only remind once per bot lifetime)
+_privacy_mode_reminded: set[int] = set()
+
+
+async def _check_and_remind_privacy_mode(update: Update) -> None:
+    """Send a one-time Privacy Mode reminder when bot first operates in a group.
+
+    Telegram's Privacy Mode (ON by default) prevents bots from receiving
+    regular messages in groups — they only see /commands and direct replies.
+    This means @mention won't work until the owner disables it via @BotFather.
+    """
+    if not _is_group_chat(update):
+        return
+    chat_id = update.effective_chat.id
+    if chat_id in _privacy_mode_reminded:
+        return
+    _privacy_mode_reminded.add(chat_id)
+
+    await update.effective_chat.send_message(
+        f"👋 *{BOT_USERNAME or 'Bot'} joined this group!*\n\n"
+        f"⚠️ *Important: Disable Privacy Mode*\n"
+        f"By default, Telegram's Privacy Mode is ON, which means "
+        f"I can only see `/commands` and direct replies — "
+        f"*@mentions won't work*.\n\n"
+        f"To fix this:\n"
+        f"1. Open @BotFather\n"
+        f"2. Send `/mybots` → select `@{BOT_USERNAME}`\n"
+        f"3. `Bot Settings` → `Group Privacy` → *Disabled*\n\n"
+        f"After that, @mention and reply will both work.",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+def _is_group_chat(update: Update) -> bool:
+    """Check if the message is from a group/supergroup chat."""
+    if not update.effective_chat:
+        return False
+    return update.effective_chat.type in ("group", "supergroup")
+
+
+def should_respond_in_group(update: Update, is_command: bool = False) -> bool:
+    """Determine if the bot should respond to this message in a group chat.
+
+    In group chats, only respond if:
+    1. Sender is the bot's owner (or authorized user), AND
+    2. Message is directed at this bot (command, @mention, or reply to bot)
+
+    With Privacy Mode OFF the bot receives ALL group messages, so we must
+    filter carefully to avoid responding to messages meant for other bots.
+
+    Always returns True for private chats.
+    """
+    if not _is_group_chat(update):
+        return True  # Private chat — always respond
+
+    user_id = update.effective_user.id
+
+    # Owner check — in group mode, must identify a specific owner.
+    # When ALLOWED_USER_IDS is empty, is_authorized() returns True for everyone
+    # (designed for private-chat auto-register), but in groups that's a security
+    # hole: anyone who @mentions the bot could control it.
+    if OWNER_USER_ID:
+        if user_id != OWNER_USER_ID:
+            return False
+    elif ALLOWED_USER_IDS:
+        # No explicit owner, but have a whitelist — check it
+        if user_id not in ALLOWED_USER_IDS:
+            return False
+    else:
+        # Neither OWNER_USER_ID nor ALLOWED_USER_IDS set — refuse ALL in group.
+        # cmd_start has its own special handling for first-user auto-registration.
+        return False
+
+    # Commands (/start, /clear, etc.) — always respond to owner
+    if is_command:
+        return True
+
+    msg = update.message or update.effective_message
+    if not msg:
+        return False
+
+    # Check @mention of this bot in message text
+    if msg.text and BOT_USERNAME:
+        if f"@{BOT_USERNAME}" in msg.text:
+            return True
+
+    # Check @mention via Telegram entities (covers cases where text matching
+    # might miss due to formatting)
+    if msg.entities and BOT_USERNAME:
+        for entity in msg.entities:
+            if entity.type == "mention":
+                mention_text = msg.text[entity.offset:entity.offset + entity.length]
+                if mention_text.lower() == f"@{BOT_USERNAME}".lower():
+                    return True
+
+    # Check if replying to this bot's message
+    if msg.reply_to_message and msg.reply_to_message.from_user:
+        reply_username = msg.reply_to_message.from_user.username
+        if reply_username and BOT_USERNAME:
+            if reply_username.lower() == BOT_USERNAME.lower():
+                return True
+
+    # Check if replying to another bot's message (cross-bot context transfer)
+    if msg.reply_to_message and msg.reply_to_message.from_user:
+        if msg.reply_to_message.from_user.is_bot:
+            # Owner is quoting another bot — respond to provide analysis
+            # But only if message text also @mentions this bot
+            if msg.text and BOT_USERNAME and f"@{BOT_USERNAME}" in msg.text:
+                return True
+
+    # Privacy Mode OFF: owner's plain message without @mention or reply
+    # → do NOT respond (could be talking to another bot or to other people)
+    log.debug(f"Group message from owner ignored (no @mention or reply): {msg.text[:50] if msg.text else '(empty)'}...")
+    return False
+
+
+def _check_group_auth(update: Update, is_command: bool = False) -> bool | None:
+    """Unified group/private auth check.
+
+    Returns:
+        True:  authorized (group owner or authorized private user)
+        False: not authorized in group — silently ignore
+        None:  not a group chat — caller should use existing is_authorized()
+    """
+    if not _is_group_chat(update):
+        return None  # Not in group, caller uses existing logic
+    return should_respond_in_group(update, is_command=is_command)
+
+
+def extract_reply_context(update: Update) -> str | None:
+    """Extract quoted message context when user replies to another bot/user message.
+
+    Returns formatted context string to prepend to the prompt,
+    or None if not a relevant reply.
+    """
+    msg = update.message or update.effective_message
+    if not msg or not msg.reply_to_message:
+        return None
+
+    replied = msg.reply_to_message
+
+    # Skip if replying to own bot's message (normal conversation flow)
+    if replied.from_user and BOT_USERNAME:
+        if replied.from_user.username == BOT_USERNAME:
+            return None
+
+    # Build sender identity
+    sender_name = "Unknown"
+    if replied.from_user:
+        if replied.from_user.username:
+            sender_name = f"@{replied.from_user.username}"
+        elif replied.from_user.full_name:
+            sender_name = replied.from_user.full_name
+
+    quoted_text = replied.text or replied.caption or "[non-text message]"
+
+    return (
+        f"[Quoted message from {sender_name}]\n"
+        f"```\n{quoted_text}\n```"
+    )
+
+
+def strip_bot_mention(text: str) -> str:
+    """Remove @bot_username mention from message text."""
+    if BOT_USERNAME:
+        text = re.sub(rf"@{re.escape(BOT_USERNAME)}\b", "", text).strip()
+    return text
 
 
 # ─── Activity extraction from SDK messages ──────────────────────────────────
@@ -992,15 +1188,33 @@ async def send_files_to_chat(chat, files: list[tuple[str, bool]], session_name: 
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /start command."""
+    global OWNER_USER_ID
     user = update.effective_user
     user_id = user.id
 
-    # Auto-register first user if no restriction set
-    if not ALLOWED_USER_IDS:
+    # ── Auto-register: first /start user becomes owner ──
+    # This runs BEFORE the normal auth check so the very first user can register.
+    # Works in both private chat and group chat.
+    if not OWNER_USER_ID and not ALLOWED_USER_IDS:
+        OWNER_USER_ID = user_id
+        ALLOWED_USER_IDS.add(user_id)
+        log.info(f"Auto-registered owner: {user.full_name} (ID: {user_id})")
+
+    # ── Standard auth ──
+    group_auth = _check_group_auth(update, is_command=True)
+    if group_auth is False:
+        return
+
+    # First time in this group? Remind about Privacy Mode
+    if _is_group_chat(update):
+        await _check_and_remind_privacy_mode(update)
+
+    # Private chat auto-register (fallback, e.g. OWNER set in env but list empty)
+    if group_auth is None and not ALLOWED_USER_IDS:
         ALLOWED_USER_IDS.add(user_id)
         log.info(f"Auto-registered user: {user.full_name} (ID: {user_id})")
 
-    if not is_authorized(user_id):
+    if group_auth is None and not is_authorized(user_id):
         await update.message.reply_text("Unauthorized.")
         return
 
@@ -1039,7 +1253,10 @@ async def cmd_clear(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         /clear casimir   - clear named session (keeps name and cwd, resets context)
     """
     user_id = update.effective_user.id
-    if not is_authorized(user_id):
+    group_auth = _check_group_auth(update, is_command=True)
+    if group_auth is False:
+        return
+    if group_auth is None and not is_authorized(user_id):
         return
 
     target_name = ctx.args[0] if ctx.args else None
@@ -1091,7 +1308,10 @@ async def cmd_clear(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_delete(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /delete <name> - delete a specific session."""
     user_id = update.effective_user.id
-    if not is_authorized(user_id):
+    group_auth = _check_group_auth(update, is_command=True)
+    if group_auth is False:
+        return
+    if group_auth is None and not is_authorized(user_id):
         return
 
     if not ctx.args:
@@ -1131,7 +1351,10 @@ async def cmd_delete(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_sync(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /sync - manually trigger memory notebook sync."""
     user_id = update.effective_user.id
-    if not is_authorized(user_id):
+    group_auth = _check_group_auth(update, is_command=True)
+    if group_auth is False:
+        return
+    if group_auth is None and not is_authorized(user_id):
         return
 
     # Use active session's cwd for project detection
@@ -1177,7 +1400,10 @@ async def cmd_new(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         /new build ~/ashare      - named 'build', cwd = expanded path
     """
     user_id = update.effective_user.id
-    if not is_authorized(user_id):
+    group_auth = _check_group_auth(update, is_command=True)
+    if group_auth is False:
+        return
+    if group_auth is None and not is_authorized(user_id):
         return
 
     name = None
@@ -1222,7 +1448,10 @@ async def cmd_new(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_switch(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /switch <name> - switch to an existing session."""
     user_id = update.effective_user.id
-    if not is_authorized(user_id):
+    group_auth = _check_group_auth(update, is_command=True)
+    if group_auth is False:
+        return
+    if group_auth is None and not is_authorized(user_id):
         return
 
     if not ctx.args:
@@ -1267,7 +1496,10 @@ async def cmd_switch(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_sessions(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /sessions - list all sessions."""
     user_id = update.effective_user.id
-    if not is_authorized(user_id):
+    group_auth = _check_group_auth(update, is_command=True)
+    if group_auth is False:
+        return
+    if group_auth is None and not is_authorized(user_id):
         return
 
     sessions = list_sessions(user_id)
@@ -1300,7 +1532,10 @@ async def cmd_sessions(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /status - show bot status."""
     user_id = update.effective_user.id
-    if not is_authorized(user_id):
+    group_auth = _check_group_auth(update, is_command=True)
+    if group_auth is False:
+        return
+    if group_auth is None and not is_authorized(user_id):
         return
 
     active_name = user_active_session.get(user_id, "none")
@@ -1341,7 +1576,10 @@ async def cmd_cd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """
     global WORK_DIR
     user_id = update.effective_user.id
-    if not is_authorized(user_id):
+    group_auth = _check_group_auth(update, is_command=True)
+    if group_auth is False:
+        return
+    if group_auth is None and not is_authorized(user_id):
         return
 
     # Get current active session
@@ -1413,7 +1651,10 @@ async def cmd_cd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_session(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /session - show current session info."""
     user_id = update.effective_user.id
-    if not is_authorized(user_id):
+    group_auth = _check_group_auth(update, is_command=True)
+    if group_auth is False:
+        return
+    if group_auth is None and not is_authorized(user_id):
         return
 
     active_name = user_active_session.get(user_id)
@@ -1440,7 +1681,10 @@ async def cmd_session(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_kill(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /kill [session_name] - interrupt a running Claude session."""
     user_id = update.effective_user.id
-    if not is_authorized(user_id):
+    group_auth = _check_group_auth(update, is_command=True)
+    if group_auth is False:
+        return
+    if group_auth is None and not is_authorized(user_id):
         return
 
     sessions = user_all_sessions.get(user_id, {})
@@ -1491,7 +1735,10 @@ async def cmd_kill(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle file/photo/video uploads - download to server and optionally forward to Claude."""
     user_id = update.effective_user.id
-    if not is_authorized(user_id):
+    group_auth = _check_group_auth(update)
+    if group_auth is False:
+        return
+    if group_auth is None and not is_authorized(user_id):
         await update.message.reply_text("Unauthorized. Send /start first.")
         return
 
@@ -1626,6 +1873,13 @@ async def handle_unknown_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
     CLI built-in commands (/skills, /help, etc.) are intercepted and either
     rewritten to natural language or rejected with a message.
     """
+    # Group chat: only respond to owner
+    group_auth = _check_group_auth(update, is_command=True)
+    if group_auth is False:
+        return
+    if group_auth is None and not is_authorized(update.effective_user.id):
+        return
+
     text = update.message.text or ""
     # Extract command name (e.g. "/skills" -> "skills", "/skills@botname" -> "skills")
     cmd = text.split()[0].lstrip("/").split("@")[0].lower() if text else ""
@@ -1647,11 +1901,21 @@ async def handle_unknown_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle regular text messages - forward to Claude with per-session parallel execution."""
     user_id = update.effective_user.id
-    if not is_authorized(user_id):
+
+    # Group chat: only respond to owner
+    group_auth = _check_group_auth(update)
+    if group_auth is False:
+        return
+    if group_auth is None and not is_authorized(user_id):
         await update.message.reply_text("Unauthorized. Send /start first.")
         return
 
     text = update.message.text
+    if not text:
+        return
+
+    # Strip @bot_username mention from message text (common in groups)
+    text = strip_bot_mention(text)
     if not text:
         return
 
@@ -1660,8 +1924,28 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text("Answer received.")
         return
 
+    # Check for mid-discussion injection in groups
+    if _is_group_chat(update) and active_discussions:
+        chat_id = update.effective_chat.id
+        for disc in active_discussions.values():
+            if disc.chat_id == chat_id and disc.status == "in_progress":
+                disc.owner_injections.append(text)
+                await update.message.reply_text(
+                    f"💬 Context added to discussion `{disc.discussion_id[:8]}`.\n"
+                    f"Will be included in next round.",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+                return
+
+    # Extract reply context (for cross-bot info transfer in groups)
+    reply_context = extract_reply_context(update)
+
     # Resolve target session: supports @session_name prefix
     session_name, session_id, prompt = resolve_session_target(user_id, text)
+
+    # Prepend reply context to prompt if present
+    if reply_context:
+        prompt = f"{reply_context}\n\nUser's message: {prompt}"
     lock = get_session_lock(session_id)
 
     # Track pending count per session
@@ -1719,6 +2003,618 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
             await send_files_to_chat(update.message.chat, sendable, session_name)
 
 
+# ─── Shared Directory Bot-to-Bot Communication ──────────────────────────────
+
+import json
+
+# Global reference to Telegram app (used by discussion handlers)
+_telegram_app: Application | None = None
+
+# Active discussions: discussion_id -> DiscussionState
+active_discussions: dict[str, "DiscussionState"] = {}
+
+# Background polling task reference
+_poll_task: asyncio.Task | None = None
+
+
+class DiscussionState:
+    """Tracks state of a bot-to-bot discussion."""
+    def __init__(self, discussion_id: str, topic: str,
+                 initiator_bot: str, responder_bot: str,
+                 chat_id: int, max_rounds: int = 5):
+        self.discussion_id = discussion_id
+        self.topic = topic
+        self.initiator_bot = initiator_bot    # bot username
+        self.responder_bot = responder_bot    # bot username
+        self.chat_id = chat_id               # group chat to post progress
+        self.max_rounds = max_rounds
+        self.current_round = 0
+        self.rounds: list[dict[str, str]] = []
+        self.status = "pending"  # pending|accepted|in_progress|completed|cancelled
+        self.session_id: str | None = None
+        self.owner_injections: list[str] = []
+        self.created_at = time.time()
+        self.initiator_name = ""  # e.g. "@BotA"
+
+
+def _disc_dir(discussion_id: str) -> str:
+    """Get the shared directory path for a discussion."""
+    d = os.path.join(SHARED_DIR, "discussions", discussion_id)
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _write_shared_json(path: str, data: dict) -> None:
+    """Atomically write JSON to a shared file (write-then-rename)."""
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
+def _read_shared_json(path: str) -> dict | None:
+    """Read JSON from a shared file, return None if missing/corrupt."""
+    try:
+        with open(path, "r") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+
+async def _notify_owner(text: str, chat_id: int | None = None) -> None:
+    """Send a notification message to the bot owner."""
+    if not _telegram_app:
+        return
+    target = chat_id or OWNER_USER_ID
+    if not target:
+        return
+    try:
+        await _telegram_app.bot.send_message(target, text, parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        log.warning(f"Failed to notify owner: {e}")
+
+
+async def _send_to_group(chat_id: int, text: str) -> None:
+    """Send a message to a group chat (for discussion progress updates)."""
+    if not _telegram_app:
+        return
+    try:
+        parts = split_message(text)
+        for part in parts:
+            try:
+                await _telegram_app.bot.send_message(chat_id, part, parse_mode=ParseMode.MARKDOWN)
+            except Exception:
+                await _telegram_app.bot.send_message(chat_id, part)
+    except Exception as e:
+        log.warning(f"Failed to send to group {chat_id}: {e}")
+
+
+# ─── Shared directory: write requests/rounds ─────────────────────────────────
+
+
+def _write_discuss_request(state: DiscussionState,
+                           responder_name: str = "") -> None:
+    """Write a discussion request file for the target bot to pick up."""
+    path = os.path.join(SHARED_DIR, "requests", f"{state.discussion_id}.json")
+    _write_shared_json(path, {
+        "discussion_id": state.discussion_id,
+        "topic": state.topic,
+        "initiator_bot": state.initiator_bot,
+        "responder_bot": state.responder_bot,
+        "responder_name": f"@{responder_name}" if responder_name else "",
+        "chat_id": state.chat_id,
+        "max_rounds": state.max_rounds,
+        "initiator_name": state.initiator_name,
+        "status": "pending",
+        "created_at": state.created_at,
+    })
+
+
+def _write_discuss_accept(discussion_id: str) -> None:
+    """Write an accept signal to the discussion directory."""
+    d = _disc_dir(discussion_id)
+    _write_shared_json(os.path.join(d, "accept.json"), {
+        "discussion_id": discussion_id,
+        "accepted_by": BOT_USERNAME,
+        "timestamp": time.time(),
+    })
+
+
+def _write_discuss_reject(discussion_id: str) -> None:
+    """Write a reject signal to the discussion directory."""
+    d = _disc_dir(discussion_id)
+    _write_shared_json(os.path.join(d, "reject.json"), {
+        "discussion_id": discussion_id,
+        "rejected_by": BOT_USERNAME,
+        "timestamp": time.time(),
+    })
+
+
+def _write_discuss_round(discussion_id: str, round_number: int,
+                         sender: str, content: str) -> None:
+    """Write a discussion round file for the other bot to pick up."""
+    d = _disc_dir(discussion_id)
+    path = os.path.join(d, f"round_{round_number}.json")
+    _write_shared_json(path, {
+        "discussion_id": discussion_id,
+        "round_number": round_number,
+        "sender": sender,
+        "content": content,
+        "timestamp": time.time(),
+    })
+
+
+def _write_discuss_cancel(discussion_id: str) -> None:
+    """Write a cancel marker to the discussion directory."""
+    d = _disc_dir(discussion_id)
+    _write_shared_json(os.path.join(d, "cancel.json"), {
+        "discussion_id": discussion_id,
+        "cancelled_by": BOT_USERNAME,
+        "timestamp": time.time(),
+    })
+
+
+async def _process_discussion_round(state: DiscussionState) -> None:
+    """Process a received discussion round by generating this bot's response.
+
+    Called as a background task when a round is received via API.
+    """
+    state.status = "in_progress"
+
+    # Build prompt for Claude with full discussion context
+    prompt_parts = [
+        f"You are participating in a structured discussion about: {state.topic}",
+        f"This is round {state.current_round + 1} of {state.max_rounds}.",
+        "",
+        "Discussion so far:",
+    ]
+
+    for i, round_data in enumerate(state.rounds):
+        prompt_parts.append(f"[Round {i+1} - {round_data['role']}]: {round_data['content']}")
+
+    # Include any owner injections
+    if state.owner_injections:
+        prompt_parts.append("\nAdditional context from your owner:")
+        for injection in state.owner_injections:
+            prompt_parts.append(f"  - {injection}")
+        state.owner_injections.clear()
+
+    if state.current_round + 1 >= state.max_rounds:
+        prompt_parts.append(
+            "\nThis is the FINAL round. Provide a clear conclusion or summary "
+            "of the discussion, highlighting areas of agreement and disagreement."
+        )
+    else:
+        prompt_parts.append(
+            "\nProvide your response for this round. Be constructive and "
+            "build on the previous points."
+        )
+
+    prompt = "\n".join(prompt_parts)
+
+    # Create or reuse a dedicated session for this discussion
+    if not state.session_id:
+        state.session_id = str(uuid.uuid4())
+
+    # Call Claude
+    response, activity_log = await call_claude(
+        prompt, state.session_id,
+        session_name=f"discuss-{state.discussion_id[:6]}",
+    )
+
+    # Post progress to group chat
+    round_num = state.current_round + 1
+    await _send_to_group(
+        state.chat_id,
+        f"**[@{BOT_USERNAME} — Round {round_num}/{state.max_rounds}]**\n{response}"
+    )
+
+    # Record our response
+    state.rounds.append({
+        "role": f"@{BOT_USERNAME}",
+        "content": response,
+    })
+    state.current_round = round_num
+
+    # Check if discussion is complete
+    if state.current_round >= state.max_rounds:
+        state.status = "completed"
+        await _send_to_group(
+            state.chat_id,
+            f"✅ Discussion '{state.topic}' completed after {state.max_rounds} rounds."
+        )
+        # Cleanup after a short delay
+        await asyncio.sleep(10)
+        active_discussions.pop(state.discussion_id, None)
+        return
+
+    # Write our response to shared directory for the other bot to pick up
+    _write_discuss_round(
+        state.discussion_id, state.current_round,
+        f"@{BOT_USERNAME}", response,
+    )
+
+
+async def _start_discussion_as_initiator(state: DiscussionState) -> None:
+    """Generate and send the first round of discussion as the initiator."""
+    state.status = "in_progress"
+
+    prompt = (
+        f"You are initiating a structured discussion about: {state.topic}\n"
+        f"This is round 1 of {state.max_rounds}.\n\n"
+        f"Present your initial analysis and viewpoint on the topic. "
+        f"Be thorough but concise."
+    )
+
+    if not state.session_id:
+        state.session_id = str(uuid.uuid4())
+
+    response, _ = await call_claude(
+        prompt, state.session_id,
+        session_name=f"discuss-{state.discussion_id[:6]}",
+    )
+
+    # Post to group
+    await _send_to_group(
+        state.chat_id,
+        f"**[@{BOT_USERNAME} — Round 1/{state.max_rounds}]**\n{response}"
+    )
+
+    state.rounds.append({
+        "role": f"@{BOT_USERNAME}",
+        "content": response,
+    })
+    state.current_round = 1
+
+    if state.max_rounds <= 1:
+        state.status = "completed"
+        await _send_to_group(state.chat_id,
+                             f"✅ Discussion '{state.topic}' completed.")
+        await asyncio.sleep(10)
+        active_discussions.pop(state.discussion_id, None)
+        return
+
+    # Write first round to shared directory for responder to pick up
+    _write_discuss_round(
+        state.discussion_id, 1,
+        f"@{BOT_USERNAME}", response,
+    )
+
+
+async def _poll_shared_directory() -> None:
+    """Background task: poll the shared directory for new requests, accepts, rounds, etc.
+
+    Runs every SHARED_POLL_INTERVAL seconds. Checks:
+    1. New discussion requests (requests/{id}.json)
+    2. Accept/reject signals (discussions/{id}/accept.json, reject.json)
+    3. New discussion rounds (discussions/{id}/round_{N}.json)
+    4. Cancel signals (discussions/{id}/cancel.json)
+    """
+    if not SHARED_DIR:
+        return
+
+    log.info(f"Shared directory poller started (interval={SHARED_POLL_INTERVAL}s)")
+    requests_dir = os.path.join(SHARED_DIR, "requests")
+    discussions_dir = os.path.join(SHARED_DIR, "discussions")
+
+    # Track which files we've already processed to avoid re-processing
+    processed_files: set[str] = set()
+
+    while True:
+        try:
+            await asyncio.sleep(SHARED_POLL_INTERVAL)
+
+            # 1. Check for new discussion requests targeted at this bot
+            if os.path.isdir(requests_dir):
+                for fname in os.listdir(requests_dir):
+                    fpath = os.path.join(requests_dir, fname)
+                    if fpath in processed_files:
+                        continue
+                    data = _read_shared_json(fpath)
+                    if not data:
+                        continue
+                    # Only process requests targeted at this bot
+                    responder = data.get("responder_name", "").lstrip("@").lower()
+                    if responder != BOT_USERNAME.lower():
+                        continue
+
+                    processed_files.add(fpath)
+                    discussion_id = data["discussion_id"]
+
+                    state = DiscussionState(
+                        discussion_id=discussion_id,
+                        topic=data["topic"],
+                        initiator_bot=data.get("initiator_bot", ""),
+                        responder_bot=f"@{BOT_USERNAME}",
+                        chat_id=data["chat_id"],
+                        max_rounds=data.get("max_rounds", 5),
+                    )
+                    state.initiator_name = data.get("initiator_name", "Unknown bot")
+                    active_discussions[discussion_id] = state
+
+                    # Notify owner in group chat
+                    await _notify_owner(
+                        f"📩 Discussion request from {state.initiator_name}:\n"
+                        f"Topic: _{state.topic}_\n"
+                        f"Max rounds: {state.max_rounds}\n\n"
+                        f"`/accept {discussion_id}`\n"
+                        f"`/reject {discussion_id}`",
+                        chat_id=state.chat_id,
+                    )
+                    log.info(f"Received discussion request {discussion_id} "
+                             f"from {state.initiator_name}")
+
+            # 2. Check for accept/reject/cancel signals and new rounds
+            for did, state in list(active_discussions.items()):
+                disc_dir = _disc_dir(did)
+                if not os.path.isdir(disc_dir):
+                    continue
+
+                # Check accept signal (initiator watches for this)
+                accept_path = os.path.join(disc_dir, "accept.json")
+                if (accept_path not in processed_files
+                        and os.path.exists(accept_path)):
+                    processed_files.add(accept_path)
+                    if state.status in ("pending", "requesting"):
+                        state.status = "accepted"
+                        log.info(f"Discussion {did} accepted")
+                        asyncio.create_task(
+                            _start_discussion_as_initiator(state))
+
+                # Check reject signal
+                reject_path = os.path.join(disc_dir, "reject.json")
+                if (reject_path not in processed_files
+                        and os.path.exists(reject_path)):
+                    processed_files.add(reject_path)
+                    state.status = "rejected"
+                    await _send_to_group(
+                        state.chat_id,
+                        f"❌ Discussion '{state.topic}' was rejected.")
+                    active_discussions.pop(did, None)
+                    continue
+
+                # Check cancel signal
+                cancel_path = os.path.join(disc_dir, "cancel.json")
+                if (cancel_path not in processed_files
+                        and os.path.exists(cancel_path)):
+                    processed_files.add(cancel_path)
+                    state.status = "cancelled"
+                    await _send_to_group(
+                        state.chat_id,
+                        f"❌ Discussion '{state.topic}' cancelled.")
+                    active_discussions.pop(did, None)
+                    continue
+
+                # Check for new rounds (only process rounds from the OTHER bot)
+                if state.status not in ("in_progress", "accepted"):
+                    continue
+
+                expected_round = state.current_round + 1
+                round_path = os.path.join(
+                    disc_dir, f"round_{expected_round}.json")
+                if (round_path not in processed_files
+                        and os.path.exists(round_path)):
+                    round_data = _read_shared_json(round_path)
+                    if round_data:
+                        sender = round_data.get("sender", "")
+                        # Only process rounds from the OTHER bot
+                        if sender.lstrip("@").lower() != BOT_USERNAME.lower():
+                            processed_files.add(round_path)
+                            state.rounds.append({
+                                "role": sender,
+                                "content": round_data["content"],
+                            })
+                            state.current_round = round_data["round_number"]
+                            log.info(f"Discussion {did}: received round "
+                                     f"{state.current_round} from {sender}")
+                            asyncio.create_task(
+                                _process_discussion_round(state))
+
+        except asyncio.CancelledError:
+            log.info("Shared directory poller stopped")
+            return
+        except Exception as e:
+            log.error(f"Error in shared directory poller: {e}", exc_info=True)
+            await asyncio.sleep(5)  # back off on error
+
+
+async def post_init(application: Application) -> None:
+    """Post-init callback: set bot username and start shared directory poller."""
+    global _telegram_app, _poll_task, BOT_USERNAME
+
+    _telegram_app = application
+
+    # Set bot username dynamically
+    me = await application.bot.get_me()
+    BOT_USERNAME = me.username or ""
+    log.info(f"Bot username: @{BOT_USERNAME}")
+
+    if OWNER_USER_ID:
+        log.info(f"Owner user ID: {OWNER_USER_ID}")
+
+    if SHARED_DIR:
+        log.info(f"Shared directory: {SHARED_DIR}")
+        _poll_task = asyncio.create_task(_poll_shared_directory())
+    else:
+        log.info("GROUP_SHARED_DIR not set, shared directory polling disabled")
+
+
+async def post_shutdown(application: Application) -> None:
+    """Post-shutdown callback: stop shared directory poller."""
+    global _poll_task
+    if _poll_task and not _poll_task.done():
+        _poll_task.cancel()
+        try:
+            await _poll_task
+        except asyncio.CancelledError:
+            pass
+        log.info("Shared directory poller cleaned up")
+
+
+# ─── Discussion commands ─────────────────────────────────────────────────────
+
+
+async def cmd_propose(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /propose @BotB 'topic' [rounds] - initiate a discussion with another bot.
+
+    Usage:
+        /propose @BotB "Should we refactor the auth module?" 5
+        /propose @BotB "Review the API changes"
+    """
+    user_id = update.effective_user.id
+    group_auth = _check_group_auth(update, is_command=True)
+    if group_auth is False:
+        return
+    if group_auth is None and not is_authorized(user_id):
+        return
+
+    if not SHARED_DIR:
+        await update.message.reply_text(
+            "⚠️ Shared directory not configured. Set GROUP_SHARED_DIR in env.")
+        return
+
+    if not ctx.args or len(ctx.args) < 2:
+        await update.message.reply_text(
+            "Usage: `/propose @BotName topic [max_rounds]`\n"
+            "Example: `/propose @ClaudeBot2 'Review auth changes' 5`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    target_bot = ctx.args[0].lstrip("@")
+
+    # Parse topic (remaining args, possibly quoted) and optional max_rounds at end
+    remaining = " ".join(ctx.args[1:])
+    max_rounds = 5
+    parts = remaining.rsplit(" ", 1)
+    if len(parts) == 2 and parts[1].isdigit():
+        max_rounds = int(parts[1])
+        remaining = parts[0]
+    topic = remaining.strip("'\"")
+
+    # Create discussion
+    discussion_id = str(uuid.uuid4())[:12]
+    chat_id = update.effective_chat.id
+
+    state = DiscussionState(
+        discussion_id=discussion_id,
+        topic=topic,
+        initiator_bot=f"@{BOT_USERNAME}",
+        responder_bot=f"@{target_bot}",
+        chat_id=chat_id,
+        max_rounds=max_rounds,
+    )
+    state.status = "pending"
+    state.initiator_name = f"@{BOT_USERNAME}"
+    active_discussions[discussion_id] = state
+
+    # Write request to shared directory (target bot's poller will pick it up)
+    _write_discuss_request(state, responder_name=target_bot)
+
+    await update.message.reply_text(
+        f"📤 Discussion request sent to `@{target_bot}`.\n"
+        f"Topic: _{topic}_\n"
+        f"Max rounds: {max_rounds}\n"
+        f"Waiting for acceptance...",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+async def cmd_accept(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /accept [discussion_id] - accept a pending discussion request."""
+    user_id = update.effective_user.id
+    group_auth = _check_group_auth(update, is_command=True)
+    if group_auth is False:
+        return
+    if group_auth is None and not is_authorized(user_id):
+        return
+
+    # Find pending discussion
+    if ctx.args:
+        discussion_id = ctx.args[0]
+    else:
+        pending = [d for d in active_discussions.values() if d.status == "pending"]
+        if not pending:
+            await update.message.reply_text("No pending discussion requests.")
+            return
+        discussion_id = pending[-1].discussion_id
+
+    state = active_discussions.get(discussion_id)
+    if not state or state.status != "pending":
+        await update.message.reply_text(
+            f"Discussion `{discussion_id}` not found or not pending.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    state.status = "accepted"
+
+    # Write accept signal to shared directory (initiator's poller will pick it up)
+    _write_discuss_accept(discussion_id)
+
+    await update.message.reply_text(
+        f"✅ Discussion accepted!\n"
+        f"Topic: _{state.topic}_\n"
+        f"Waiting for {state.initiator_name} to start round 1...",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+async def cmd_reject(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /reject [discussion_id] - reject a pending discussion request."""
+    user_id = update.effective_user.id
+    group_auth = _check_group_auth(update, is_command=True)
+    if group_auth is False:
+        return
+    if group_auth is None and not is_authorized(user_id):
+        return
+
+    if ctx.args:
+        discussion_id = ctx.args[0]
+    else:
+        pending = [d for d in active_discussions.values() if d.status == "pending"]
+        if not pending:
+            await update.message.reply_text("No pending discussion requests.")
+            return
+        discussion_id = pending[-1].discussion_id
+
+    state = active_discussions.pop(discussion_id, None)
+    if not state:
+        await update.message.reply_text("Discussion not found.")
+        return
+
+    # Write reject signal to shared directory
+    _write_discuss_reject(discussion_id)
+
+    await update.message.reply_text(
+        f"❌ Discussion rejected: _{state.topic}_",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+async def cmd_discussions(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /discussions - list active discussions."""
+    user_id = update.effective_user.id
+    group_auth = _check_group_auth(update, is_command=True)
+    if group_auth is False:
+        return
+    if group_auth is None and not is_authorized(user_id):
+        return
+
+    if not active_discussions:
+        await update.message.reply_text("No active discussions.")
+        return
+
+    lines = ["Active discussions:"]
+    for did, state in active_discussions.items():
+        lines.append(
+            f"  `{did}` — _{state.topic}_\n"
+            f"    Status: {state.status} | "
+            f"Round: {state.current_round}/{state.max_rounds}"
+        )
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+
+
 # ─── Main ────────────────────────────────────────────────────────────────────
 
 
@@ -1733,7 +2629,12 @@ def main():
     else:
         log.info("No user restriction - first /start user will be registered")
 
-    app = Application.builder().token(BOT_TOKEN).concurrent_updates(True).build()
+    app = (Application.builder()
+           .token(BOT_TOKEN)
+           .concurrent_updates(True)
+           .post_init(post_init)
+           .post_shutdown(post_shutdown)
+           .build())
 
     # Register handlers
     app.add_handler(CommandHandler("start", cmd_start))
@@ -1747,6 +2648,11 @@ def main():
     app.add_handler(CommandHandler("kill", cmd_kill))
     app.add_handler(CommandHandler("delete", cmd_delete))
     app.add_handler(CommandHandler("sync", cmd_sync))
+    # Discussion commands
+    app.add_handler(CommandHandler("propose", cmd_propose))
+    app.add_handler(CommandHandler("accept", cmd_accept))
+    app.add_handler(CommandHandler("reject", cmd_reject))
+    app.add_handler(CommandHandler("discussions", cmd_discussions))
     # AskUserQuestion callback handler (must be before general message handler)
     app.add_handler(CallbackQueryHandler(handle_ask_callback, pattern=r"^ask:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
