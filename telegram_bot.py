@@ -142,16 +142,67 @@ user_session_counter: dict[int, int] = {}
 session_work_dirs: dict[str, str] = {}
 
 # Project shortname -> full path mapping
-PROJECT_SHORTCUTS: dict[str, str] = {
+# Fallback shortcuts (used if CLAUDE.md parsing fails)
+_FALLBACK_SHORTCUTS: dict[str, str] = {
     "tgcc": "/home/gkh/claude_tasks/claude-telegram-bot",
     "ashare": "/home/gkh/ashare",
-    "casimir_ashare": "/home/gkh/ashare/casimir_ashare",
-    "bookmodel": "/home/gkh/claude_tasks/bookmodel_slippage",
-    "bookmodel_slippage": "/home/gkh/claude_tasks/bookmodel_slippage",
-    "revenue": "/home/gkh/revenue",
-    "rena": "/home/gkh/revenue",
     "tmp": "/home/gkh/claude_tasks/tmp_task",
 }
+
+CLAUDE_MD_PATH = os.path.expanduser("~/.claude/CLAUDE.md")
+_shortcuts_cache: dict[str, str] | None = None
+_shortcuts_mtime: float = 0.0
+
+
+def _load_shortcuts_from_claude_md() -> dict[str, str]:
+    """Parse project shortcuts table from CLAUDE.md.
+
+    Reads the '## 项目简称映射' section and extracts shortcut -> path mappings.
+    Returns fallback shortcuts if CLAUDE.md is missing or parse fails.
+    """
+    try:
+        with open(CLAUDE_MD_PATH, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except OSError:
+        return dict(_FALLBACK_SHORTCUTS)
+
+    shortcuts: dict[str, str] = {}
+    in_section = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("## 项目简称映射"):
+            in_section = True
+            continue
+        if in_section and stripped.startswith("## ") and "项目简称映射" not in stripped:
+            break  # next section
+        if not in_section:
+            continue
+        # skip header and separator rows
+        if stripped.startswith("|") and "---" in stripped:
+            continue
+        if stripped.startswith("| 简称"):
+            continue
+        if stripped.startswith("|"):
+            cols = [c.strip().strip("`") for c in stripped.split("|")]
+            # cols: ['', shortcut, path, desc, '']
+            if len(cols) >= 4 and cols[1] and cols[2]:
+                shortcuts[cols[1]] = cols[2]
+
+    return shortcuts if shortcuts else dict(_FALLBACK_SHORTCUTS)
+
+
+def get_project_shortcuts() -> dict[str, str]:
+    """Get project shortcuts, reloading from CLAUDE.md if file changed."""
+    global _shortcuts_cache, _shortcuts_mtime
+    try:
+        mtime = os.path.getmtime(CLAUDE_MD_PATH)
+    except OSError:
+        mtime = 0.0
+    if _shortcuts_cache is None or mtime != _shortcuts_mtime:
+        _shortcuts_cache = _load_shortcuts_from_claude_md()
+        _shortcuts_mtime = mtime
+        logging.info("Reloaded project shortcuts from CLAUDE.md: %s", list(_shortcuts_cache.keys()))
+    return _shortcuts_cache
 
 # Pending AskUserQuestion futures: question_id -> asyncio.Future
 pending_questions: dict[str, asyncio.Future] = {}
@@ -183,9 +234,10 @@ def resolve_cwd(cwd_arg: Optional[str]) -> Optional[str]:
     if not cwd_arg:
         return None
 
-    # Check project shortcuts first
-    if cwd_arg in PROJECT_SHORTCUTS:
-        path = PROJECT_SHORTCUTS[cwd_arg]
+    # Check project shortcuts first (dynamically loaded from CLAUDE.md)
+    shortcuts = get_project_shortcuts()
+    if cwd_arg in shortcuts:
+        path = shortcuts[cwd_arg]
     else:
         path = os.path.expanduser(cwd_arg)
         if not os.path.isabs(path):
@@ -1141,7 +1193,7 @@ async def cmd_new(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 cwd = resolved
             else:
                 # Check if it looks like a shortname typo
-                available = ", ".join(f"`{k}`" for k in sorted(PROJECT_SHORTCUTS.keys()))
+                available = ", ".join(f"`{k}`" for k in sorted(get_project_shortcuts().keys()))
                 await update.message.reply_text(
                     f"⚠️ Directory not found: `{cwd_arg}`\n\n"
                     f"Available shortcuts: {available}\n"
@@ -1157,7 +1209,7 @@ async def cmd_new(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     cwd_note = ""
     if cwd:
         cwd_arg = " ".join(ctx.args[1:])
-        cwd_note = " (shortcut)" if cwd_arg in PROJECT_SHORTCUTS else ""
+        cwd_note = " (shortcut)" if cwd_arg in get_project_shortcuts() else ""
     await update.message.reply_text(
         f"✅ New session: `{new_name}` (`{new_sid[:8]}...`)\n"
         f"📁 cwd: `{display_cwd}`{cwd_note}\n\n"
@@ -1329,7 +1381,7 @@ async def cmd_cd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     resolved = resolve_cwd(cwd_arg)
 
     if not resolved:
-        available = ", ".join(f"`{k}`" for k in sorted(PROJECT_SHORTCUTS.keys()))
+        available = ", ".join(f"`{k}`" for k in sorted(get_project_shortcuts().keys()))
         await update.message.reply_text(
             f"Directory not found: `{cwd_arg}`\n\n"
             f"Available shortcuts: {available}",
@@ -1338,7 +1390,7 @@ async def cmd_cd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     display = resolved.replace(home, "~")
-    shortcut_note = " (shortcut)" if cwd_arg in PROJECT_SHORTCUTS else ""
+    shortcut_note = " (shortcut)" if cwd_arg in get_project_shortcuts() else ""
 
     if is_global:
         WORK_DIR = resolved
