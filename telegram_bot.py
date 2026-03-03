@@ -106,16 +106,70 @@ AUTO_SYNC_SCRIPT = os.path.expanduser(
     "~/.claude/skills/memory-notebook/scripts/auto-sync.sh"
 )
 
+# ─── Persistent state (owner auto-register survives restarts) ────────────────
+
+# State file path: instances/<name>.state.yaml (or .bot-state.yaml for default)
+if _args.instance:
+    _STATE_FILE = Path(__file__).parent / "instances" / f"{_args.instance}.state.yaml"
+else:
+    _STATE_FILE = Path(__file__).parent / ".bot-state.yaml"
+
+
+def _load_state() -> dict:
+    """Load persisted bot state (owner_id, allowed_users) from YAML file."""
+    try:
+        import yaml
+        with open(_STATE_FILE, "r") as f:
+            return yaml.safe_load(f) or {}
+    except (FileNotFoundError, ImportError):
+        return {}
+
+
+def _save_state(owner_id: int | None, allowed_ids: set[int]) -> None:
+    """Persist bot state to YAML file."""
+    try:
+        import yaml
+        data = {
+            "owner_user_id": owner_id,
+            "allowed_user_ids": sorted(allowed_ids) if allowed_ids else [],
+        }
+        with open(_STATE_FILE, "w") as f:
+            yaml.dump(data, f, default_flow_style=False)
+        log.info(f"Bot state saved to {_STATE_FILE}")
+    except ImportError:
+        # PyYAML not installed — fall back to json
+        import json
+        data = {
+            "owner_user_id": owner_id,
+            "allowed_user_ids": sorted(allowed_ids) if allowed_ids else [],
+        }
+        json_path = _STATE_FILE.with_suffix(".json")
+        with open(json_path, "w") as f:
+            json.dump(data, f, indent=2)
+        log.info(f"Bot state saved to {json_path} (yaml unavailable)")
+    except Exception as e:
+        log.warning(f"Failed to save bot state: {e}")
+
+
 # ─── Group Mode Configuration ────────────────────────────────────────────────
 
-# Bot owner's Telegram user ID (required for group mode)
-# If not set, derives from the first entry in TELEGRAM_ALLOWED_USERS
+# Priority: env var > state file > derive from ALLOWED_USER_IDS
 OWNER_USER_ID: int | None = None
 _owner_env = os.environ.get("TELEGRAM_OWNER_ID", "")
 if _owner_env:
     OWNER_USER_ID = int(_owner_env.strip())
 elif ALLOWED_USER_IDS:
     OWNER_USER_ID = next(iter(ALLOWED_USER_IDS))
+
+# If neither env var nor ALLOWED_USER_IDS, try loading from persisted state
+if not OWNER_USER_ID and not ALLOWED_USER_IDS:
+    _saved = _load_state()
+    if _saved.get("owner_user_id"):
+        OWNER_USER_ID = int(_saved["owner_user_id"])
+        print(f"[state] Loaded owner from {_STATE_FILE}: {OWNER_USER_ID}")
+    if _saved.get("allowed_user_ids"):
+        ALLOWED_USER_IDS = {int(x) for x in _saved["allowed_user_ids"]}
+        print(f"[state] Loaded allowed users from {_STATE_FILE}: {ALLOWED_USER_IDS}")
 
 # Bot's own username (set dynamically at startup via getMe)
 BOT_USERNAME: str = ""
@@ -1194,10 +1248,11 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     # ── Auto-register: first /start user becomes owner ──
     # This runs BEFORE the normal auth check so the very first user can register.
-    # Works in both private chat and group chat.
+    # Works in both private chat and group chat. Persisted to state file.
     if not OWNER_USER_ID and not ALLOWED_USER_IDS:
         OWNER_USER_ID = user_id
         ALLOWED_USER_IDS.add(user_id)
+        _save_state(OWNER_USER_ID, ALLOWED_USER_IDS)
         log.info(f"Auto-registered owner: {user.full_name} (ID: {user_id})")
 
     # ── Standard auth ──
@@ -1212,6 +1267,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     # Private chat auto-register (fallback, e.g. OWNER set in env but list empty)
     if group_auth is None and not ALLOWED_USER_IDS:
         ALLOWED_USER_IDS.add(user_id)
+        _save_state(OWNER_USER_ID, ALLOWED_USER_IDS)
         log.info(f"Auto-registered user: {user.full_name} (ID: {user_id})")
 
     if group_auth is None and not is_authorized(user_id):

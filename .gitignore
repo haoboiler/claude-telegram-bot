@@ -1,5 +1,7 @@
 .env
 instances/*.env
+instances/*.state.yaml
+.bot-state.yaml
 *.log
 logs/
 __pycache__/
