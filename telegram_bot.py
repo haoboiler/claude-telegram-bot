@@ -174,16 +174,6 @@ if not OWNER_USER_ID and not ALLOWED_USER_IDS:
 # Bot's own username (set dynamically at startup via getMe)
 BOT_USERNAME: str = ""
 
-# Shared directory for bot-to-bot communication (all bots on same server)
-# Structure: {SHARED_DIR}/requests/{id}.json, {SHARED_DIR}/discussions/{id}/...
-SHARED_DIR = os.environ.get("GROUP_SHARED_DIR", "")
-if SHARED_DIR:
-    os.makedirs(os.path.join(SHARED_DIR, "requests"), exist_ok=True)
-    os.makedirs(os.path.join(SHARED_DIR, "discussions"), exist_ok=True)
-
-# Polling interval for checking shared directory (seconds)
-SHARED_POLL_INTERVAL = float(os.environ.get("GROUP_POLL_INTERVAL", "2.0"))
-
 # ─── Logging ─────────────────────────────────────────────────────────────────
 
 logging.basicConfig(
@@ -194,11 +184,34 @@ log = logging.getLogger("claude-tg-bot")
 
 # ─── Session & Lock management ──────────────────────────────────────────────
 
-# Per-user current active session name: user_id -> session_name
-user_active_session: dict[int, str] = {}
+def get_topic_id(update: Update) -> int:
+    """Extract topic_id from update for session scoping.
 
-# Per-user all sessions: user_id -> {session_name: local_session_id}
-user_all_sessions: dict[int, dict[str, str]] = {}
+    In a forum group, each topic has a unique message_thread_id.
+    In private chats or non-forum groups, returns 0.
+    This allows sessions to be scoped per-topic in forum groups
+    while maintaining backward compatibility with private chats.
+    """
+    msg = update.effective_message
+    if msg and getattr(msg, "is_topic_message", False) and msg.message_thread_id:
+        topic_id = int(msg.message_thread_id)
+        topic_created = getattr(msg, "forum_topic_created", None)
+        if topic_created and getattr(topic_created, "name", None):
+            topic_names[topic_id] = topic_created.name
+        return topic_id
+    return 0
+
+
+def _thread_id_or_none(topic_id: int) -> int | None:
+    """Convert topic_id to message_thread_id parameter (None if 0)."""
+    return topic_id if topic_id else None
+
+
+# Per-topic current active session name: topic_id -> session_name
+topic_active_session: dict[int, str] = {}
+
+# Per-topic all sessions: topic_id -> {session_name: local_session_id}
+topic_all_sessions: dict[int, dict[str, str]] = {}
 
 # local_session_id -> SDK session_id (set after first successful call)
 session_sdk_ids: dict[str, str] = {}
@@ -213,8 +226,12 @@ session_pending: dict[str, int] = {}
 # Used by /kill command to interrupt stuck sessions
 session_clients: dict[str, ClaudeSDKClient] = {}
 
-# Auto-increment session counter per user for default naming
-user_session_counter: dict[int, int] = {}
+# Auto-increment session counter per topic for default naming
+topic_session_counter: dict[int, int] = {}
+
+# Cache topic names for display: topic_id -> topic_name
+# Populated from update context when available
+topic_names: dict[int, str] = {}
 
 # Per-session working directory: local_session_id -> cwd path
 session_work_dirs: dict[str, str] = {}
@@ -295,10 +312,10 @@ def get_session_lock(session_id: str) -> asyncio.Lock:
     return session_locks[session_id]
 
 
-def _next_default_name(user_id: int) -> str:
+def _next_default_name(topic_id: int) -> str:
     """Generate next default session name like s1, s2, ..."""
-    cnt = user_session_counter.get(user_id, 0) + 1
-    user_session_counter[user_id] = cnt
+    cnt = topic_session_counter.get(topic_id, 0) + 1
+    topic_session_counter[topic_id] = cnt
     return f"s{cnt}"
 
 
@@ -330,25 +347,25 @@ def get_session_cwd(session_id: str) -> str:
     return session_work_dirs.get(session_id, WORK_DIR)
 
 
-def get_or_create_session(user_id: int) -> str:
+def get_or_create_session(topic_id: int) -> str:
     """Get existing session or create a new one. Returns local_session_id."""
-    if user_id not in user_all_sessions:
-        user_all_sessions[user_id] = {}
+    if topic_id not in topic_all_sessions:
+        topic_all_sessions[topic_id] = {}
 
-    active_name = user_active_session.get(user_id)
-    if active_name and active_name in user_all_sessions[user_id]:
-        return user_all_sessions[user_id][active_name]
+    active_name = topic_active_session.get(topic_id)
+    if active_name and active_name in topic_all_sessions[topic_id]:
+        return topic_all_sessions[topic_id][active_name]
 
     # No active session - create default
-    name = _next_default_name(user_id)
+    name = _next_default_name(topic_id)
     sid = str(uuid.uuid4())
-    user_all_sessions[user_id][name] = sid
-    user_active_session[user_id] = name
-    log.info(f"New session for user {user_id}: {name} ({sid})")
+    topic_all_sessions[topic_id][name] = sid
+    topic_active_session[topic_id] = name
+    log.info(f"New session for topic {topic_id}: {name} ({sid})")
     return sid
 
 
-def create_new_session(user_id: int, name: Optional[str] = None,
+def create_new_session(topic_id: int, name: Optional[str] = None,
                        cwd: Optional[str] = None) -> tuple[str, str]:
     """Create a new session and switch to it. Returns (name, local_session_id).
 
@@ -356,44 +373,44 @@ def create_new_session(user_id: int, name: Optional[str] = None,
         cwd: Optional per-session working directory (absolute path, already resolved).
              If None, inherits global WORK_DIR at call time.
     """
-    if user_id not in user_all_sessions:
-        user_all_sessions[user_id] = {}
+    if topic_id not in topic_all_sessions:
+        topic_all_sessions[topic_id] = {}
 
     if not name:
-        name = _next_default_name(user_id)
+        name = _next_default_name(topic_id)
 
     # If name already exists, generate a unique one
-    if name in user_all_sessions[user_id]:
+    if name in topic_all_sessions[topic_id]:
         base = name
         i = 2
-        while f"{base}{i}" in user_all_sessions[user_id]:
+        while f"{base}{i}" in topic_all_sessions[topic_id]:
             i += 1
         name = f"{base}{i}"
 
     sid = str(uuid.uuid4())
-    user_all_sessions[user_id][name] = sid
-    user_active_session[user_id] = name
+    topic_all_sessions[topic_id][name] = sid
+    topic_active_session[topic_id] = name
 
     # Store per-session cwd (if provided, otherwise get_session_cwd falls back to WORK_DIR)
     if cwd:
         session_work_dirs[sid] = cwd
 
-    log.info(f"Created session for user {user_id}: {name} ({sid})"
+    log.info(f"Created session for topic {topic_id}: {name} ({sid})"
              f"{f' cwd={cwd}' if cwd else ''}")
     return name, sid
 
 
-def switch_session(user_id: int, name: str) -> Optional[str]:
+def switch_session(topic_id: int, name: str) -> Optional[str]:
     """Switch to an existing session by name. Returns session_id or None if not found."""
-    sessions = user_all_sessions.get(user_id, {})
+    sessions = topic_all_sessions.get(topic_id, {})
     if name not in sessions:
         return None
-    user_active_session[user_id] = name
-    log.info(f"User {user_id} switched to session: {name}")
+    topic_active_session[topic_id] = name
+    log.info(f"Topic {topic_id} switched to session: {name}")
     return sessions[name]
 
 
-def clear_session(user_id: int, target_name: str | None = None) -> tuple[str, str, str | None]:
+def clear_session(topic_id: int, target_name: str | None = None) -> tuple[str, str, str | None]:
     """Clear a session's context and start fresh.
 
     Args:
@@ -407,7 +424,7 @@ def clear_session(user_id: int, target_name: str | None = None) -> tuple[str, st
 
     Returns: (new_session_name, new_sid, old_cwd).
     """
-    sessions = user_all_sessions.get(user_id, {})
+    sessions = topic_all_sessions.get(topic_id, {})
 
     if target_name and target_name in sessions:
         # Clear a specific named session: keep name and cwd, reset context
@@ -423,12 +440,12 @@ def clear_session(user_id: int, target_name: str | None = None) -> tuple[str, st
         sessions[target_name] = new_sid
         if old_cwd:
             session_work_dirs[new_sid] = old_cwd
-        log.info(f"Session '{target_name}' cleared for user {user_id}, "
+        log.info(f"Session '{target_name}' cleared for topic {topic_id}, "
                  f"new sid: {new_sid} (kept name and cwd={old_cwd})")
         return target_name, new_sid, old_cwd
 
     # Clear active session (original behavior): destroy and create new auto-named
-    old_name = user_active_session.get(user_id)
+    old_name = topic_active_session.get(topic_id)
     old_cwd = None
     if old_name and old_name in sessions:
         old_sid = sessions.pop(old_name)
@@ -439,19 +456,19 @@ def clear_session(user_id: int, target_name: str | None = None) -> tuple[str, st
         session_pending.pop(old_sid, None)
         session_clients.pop(old_sid, None)
 
-    name = _next_default_name(user_id)
+    name = _next_default_name(topic_id)
     sid = str(uuid.uuid4())
-    if user_id not in user_all_sessions:
-        user_all_sessions[user_id] = {}
-    user_all_sessions[user_id][name] = sid
-    user_active_session[user_id] = name
-    log.info(f"Session cleared for user {user_id}, new: {name} ({sid})")
+    if topic_id not in topic_all_sessions:
+        topic_all_sessions[topic_id] = {}
+    topic_all_sessions[topic_id][name] = sid
+    topic_active_session[topic_id] = name
+    log.info(f"Session cleared for topic {topic_id}, new: {name} ({sid})")
     return name, sid, old_cwd
 
 
-def delete_session(user_id: int, name: str) -> tuple[bool, str, str | None]:
+def delete_session(topic_id: int, name: str) -> tuple[bool, str, str | None]:
     """Delete a specific session by name. Returns (success, message, deleted_cwd)."""
-    sessions = user_all_sessions.get(user_id, {})
+    sessions = topic_all_sessions.get(topic_id, {})
     if name not in sessions:
         return False, f"Session `{name}` not found.", None
 
@@ -474,17 +491,17 @@ def delete_session(user_id: int, name: str) -> tuple[bool, str, str | None]:
     session_clients.pop(sid, None)
 
     # If deleted the active session, switch to another or create new
-    if user_active_session.get(user_id) == name:
+    if topic_active_session.get(topic_id) == name:
         if sessions:
             new_active = next(iter(sessions))
-            user_active_session[user_id] = new_active
+            topic_active_session[topic_id] = new_active
         else:
-            new_name = _next_default_name(user_id)
+            new_name = _next_default_name(topic_id)
             new_sid = str(uuid.uuid4())
             sessions[new_name] = new_sid
-            user_active_session[user_id] = new_name
+            topic_active_session[topic_id] = new_name
 
-    log.info(f"Deleted session '{name}' ({sid[:8]}) for user {user_id}")
+    log.info(f"Deleted session '{name}' ({sid[:8]}) for topic {topic_id}")
     return True, f"Session `{name}` deleted.", deleted_cwd
 
 
@@ -519,10 +536,10 @@ async def run_auto_sync(cwd: str) -> str:
         return f"sync failed: {e}"
 
 
-def list_sessions(user_id: int) -> list[tuple[str, str, bool, bool]]:
-    """List all sessions for a user. Returns [(name, session_id, is_active, is_busy), ...]."""
-    sessions = user_all_sessions.get(user_id, {})
-    active = user_active_session.get(user_id)
+def list_sessions(topic_id: int) -> list[tuple[str, str, bool, bool]]:
+    """List all sessions for a topic. Returns [(name, session_id, is_active, is_busy), ...]."""
+    sessions = topic_all_sessions.get(topic_id, {})
+    active = topic_active_session.get(topic_id)
     result = []
     for name, sid in sessions.items():
         lock = session_locks.get(sid)
@@ -531,7 +548,7 @@ def list_sessions(user_id: int) -> list[tuple[str, str, bool, bool]]:
     return result
 
 
-def resolve_session_target(user_id: int, text: str) -> tuple[str, str, str]:
+def resolve_session_target(topic_id: int, text: str) -> tuple[str, str, str]:
     """Parse @session_name prefix from message text.
 
     Returns (session_name, local_session_id, remaining_prompt).
@@ -542,28 +559,28 @@ def resolve_session_target(user_id: int, text: str) -> tuple[str, str, str]:
         target_name, prompt = text.split(" ", 1)
         target_name = target_name[1:]  # strip @
 
-        sessions = user_all_sessions.get(user_id, {})
+        sessions = topic_all_sessions.get(topic_id, {})
         if target_name in sessions:
             sid = sessions[target_name]
             return target_name, sid, prompt
         else:
             # Auto-create new session without switching active
             # Inherit cwd from active session
-            prev_active = user_active_session.get(user_id)
+            prev_active = topic_active_session.get(topic_id)
             inherit_cwd = None
             if prev_active and prev_active in sessions:
                 active_sid = sessions[prev_active]
                 inherit_cwd = session_work_dirs.get(active_sid)
-            name, sid = create_new_session(user_id, target_name, cwd=inherit_cwd)
+            name, sid = create_new_session(topic_id, target_name, cwd=inherit_cwd)
             if prev_active:
-                user_active_session[user_id] = prev_active
+                topic_active_session[topic_id] = prev_active
             log.info(f"Auto-created session '{name}' for @mention routing"
                      f"{f' (inherited cwd={inherit_cwd})' if inherit_cwd else ''}")
             return name, sid, prompt
 
     # Default: use active session
-    sid = get_or_create_session(user_id)
-    active_name = user_active_session.get(user_id, "?")
+    sid = get_or_create_session(topic_id)
+    active_name = topic_active_session.get(topic_id, "?")
     return active_name, sid, text
 
 
@@ -596,6 +613,7 @@ async def _check_and_remind_privacy_mode(update: Update) -> None:
     if chat_id in _privacy_mode_reminded:
         return
     _privacy_mode_reminded.add(chat_id)
+    topic_id = get_topic_id(update)
 
     await update.effective_chat.send_message(
         f"👋 *{BOT_USERNAME or 'Bot'} joined this group!*\n\n"
@@ -609,6 +627,7 @@ async def _check_and_remind_privacy_mode(update: Update) -> None:
         f"3. `Bot Settings` → `Group Privacy` → *Disabled*\n\n"
         f"After that, @mention and reply will both work.",
         parse_mode=ParseMode.MARKDOWN,
+        message_thread_id=_thread_id_or_none(topic_id),
     )
 
 
@@ -821,19 +840,19 @@ async def _update_thinking_msg(thinking_msg, activity_log: list[str],
 # ─── AskUserQuestion handling ───────────────────────────────────────────────
 
 
-def _make_can_use_tool(chat, session_name: str):
+def _make_can_use_tool(chat, session_name: str, topic_id: int):
     """Create a can_use_tool callback that forwards AskUserQuestion to Telegram."""
 
     async def can_use_tool(tool_name, tool_input, context):
         if tool_name == "AskUserQuestion":
-            return await _handle_ask_user_question(tool_input, chat, session_name)
+            return await _handle_ask_user_question(tool_input, chat, session_name, topic_id)
         # Allow all other tools
         return PermissionResultAllow(updated_input=tool_input)
 
     return can_use_tool
 
 
-async def _handle_ask_user_question(tool_input: dict, chat, session_name: str):
+async def _handle_ask_user_question(tool_input: dict, chat, session_name: str, topic_id: int):
     """Forward AskUserQuestion to Telegram and wait for user response."""
     questions = tool_input.get("questions", [])
     if not questions:
@@ -883,7 +902,11 @@ async def _handle_ask_user_question(tool_input: dict, chat, session_name: str):
         pending_question_options[qid] = options
 
         try:
-            await chat.send_message(msg_text, reply_markup=markup)
+            await chat.send_message(
+                msg_text,
+                reply_markup=markup,
+                message_thread_id=_thread_id_or_none(topic_id),
+            )
             log.info(f"AskUserQuestion forwarded to Telegram: qid={qid}, question={question_text[:50]}")
 
             # Wait for user to answer (with timeout)
@@ -897,7 +920,9 @@ async def _handle_ask_user_question(tool_input: dict, chat, session_name: str):
             log.warning(f"AskUserQuestion timeout: qid={qid}, auto-selected={fallback}")
             try:
                 await chat.send_message(
-                    f"{label}No answer in {ASK_USER_TIMEOUT}s, auto-selected: {fallback}")
+                    f"{label}No answer in {ASK_USER_TIMEOUT}s, auto-selected: {fallback}",
+                    message_thread_id=_thread_id_or_none(topic_id),
+                )
             except Exception:
                 pass
         finally:
@@ -983,7 +1008,8 @@ async def _check_text_answer(chat_id: int, text: str) -> bool:
 
 async def call_claude(prompt: str, session_id: str,
                       thinking_msg=None, chat=None,
-                      session_name: str = "") -> tuple[str, list[str]]:
+                      session_name: str = "",
+                      topic_id: int = 0) -> tuple[str, list[str]]:
     """Call Claude via Agent SDK with real-time activity tracking.
 
     Uses ClaudeSDKClient for streaming mode (required for can_use_tool callback).
@@ -997,7 +1023,7 @@ async def call_claude(prompt: str, session_id: str,
         cwd=effective_cwd,
         max_turns=MAX_TURNS,
         permission_mode="bypassPermissions",
-        can_use_tool=_make_can_use_tool(chat, session_name) if chat else None,
+        can_use_tool=_make_can_use_tool(chat, session_name, topic_id) if chat else None,
         setting_sources=["user", "project"],
     )
 
@@ -1053,7 +1079,10 @@ async def call_claude(prompt: str, session_id: str,
             if chat and (now - last_heartbeat_time) >= HEARTBEAT_INTERVAL:
                 last_heartbeat_time = now
                 try:
-                    await chat.send_action(ChatAction.TYPING)
+                    await chat.send_action(
+                        ChatAction.TYPING,
+                        message_thread_id=_thread_id_or_none(topic_id),
+                    )
                 except Exception:
                     pass
 
@@ -1106,7 +1135,14 @@ async def call_claude(prompt: str, session_id: str,
                 pass
             session_clients.pop(session_id, None)
             # Retry without resume (recursive, but only once since sdk_sid is now cleared)
-            return await call_claude(prompt, session_id, chat, thinking_msg, session_name)
+            return await call_claude(
+                prompt,
+                session_id,
+                thinking_msg=thinking_msg,
+                chat=chat,
+                session_name=session_name,
+                topic_id=topic_id,
+            )
 
         if "already in use" in error_msg:
             return f"Error: Session is already in use. Try /clear to reset.", []
@@ -1212,7 +1248,12 @@ def extract_sendable_files(text: str) -> list[tuple[str, bool]]:
     return files
 
 
-async def send_files_to_chat(chat, files: list[tuple[str, bool]], session_name: str = ""):
+async def send_files_to_chat(
+    chat,
+    files: list[tuple[str, bool]],
+    session_name: str = "",
+    topic_id: int = 0,
+):
     """Send extracted files to Telegram chat as photos or documents."""
     from telegram import InputFile
 
@@ -1226,11 +1267,13 @@ async def send_files_to_chat(chat, files: list[tuple[str, bool]], session_name: 
                     await chat.send_photo(
                         photo=InputFile(f, filename=filename),
                         caption=f"{label}{filename}",
+                        message_thread_id=_thread_id_or_none(topic_id),
                     )
                 else:
                     await chat.send_document(
                         document=InputFile(f, filename=filename),
                         caption=f"{label}{filename}",
+                        message_thread_id=_thread_id_or_none(topic_id),
                     )
             log.info(f"Sent file to chat: {path}")
         except Exception as e:
@@ -1245,6 +1288,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     global OWNER_USER_ID
     user = update.effective_user
     user_id = user.id
+    topic_id = get_topic_id(update)
 
     # ── Auto-register: first /start user becomes owner ──
     # This runs BEFORE the normal auth check so the very first user can register.
@@ -1274,8 +1318,8 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("Unauthorized.")
         return
 
-    session_id = get_or_create_session(user_id)
-    active_name = user_active_session.get(user_id, "?")
+    session_id = get_or_create_session(topic_id)
+    active_name = topic_active_session.get(topic_id, "?")
     await update.message.reply_text(
         f"Claude Code Bot ready!\n\n"
         f"Your ID: `{user_id}`\n"
@@ -1288,6 +1332,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         f"/clear [name] - Reset session context\n"
         f"/delete <name> - Delete a session\n"
         f"/status - Bot status\n"
+        f"/topic [info|list] - Topic session info\n"
         f"/cd [path|shortname] - Change session cwd\n"
         f"/session - Current session info\n"
         f"/kill [name] - Kill stuck session\n"
@@ -1295,6 +1340,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         f"Send any message to interact with Claude.\n"
         f"Use `@name msg` to send to a specific session.\n"
         f"Different sessions run in parallel!\n\n"
+        f"In a forum group, each topic has its own session space.\n\n"
         f"Per-session cwd: use `/new build casimir_ashare`\n"
         f"to create a session bound to a project.",
         parse_mode=ParseMode.MARKDOWN,
@@ -1309,6 +1355,7 @@ async def cmd_clear(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         /clear casimir   - clear named session (keeps name and cwd, resets context)
     """
     user_id = update.effective_user.id
+    topic_id = get_topic_id(update)
     group_auth = _check_group_auth(update, is_command=True)
     if group_auth is False:
         return
@@ -1319,7 +1366,7 @@ async def cmd_clear(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     # Validate target exists
     if target_name:
-        sessions = user_all_sessions.get(user_id, {})
+        sessions = topic_all_sessions.get(topic_id, {})
         if target_name not in sessions:
             available = ", ".join(f"`{n}`" for n in sorted(sessions.keys()))
             await update.message.reply_text(
@@ -1329,7 +1376,7 @@ async def cmd_clear(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             )
             return
 
-    cleared_name, new_sid, old_cwd = clear_session(user_id, target_name)
+    cleared_name, new_sid, old_cwd = clear_session(topic_id, target_name)
 
     if target_name:
         # Named clear: kept name, reset context
@@ -1364,6 +1411,7 @@ async def cmd_clear(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_delete(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /delete <name> - delete a specific session."""
     user_id = update.effective_user.id
+    topic_id = get_topic_id(update)
     group_auth = _check_group_auth(update, is_command=True)
     if group_auth is False:
         return
@@ -1379,15 +1427,15 @@ async def cmd_delete(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     target_name = ctx.args[0]
-    success, message, deleted_cwd = delete_session(user_id, target_name)
+    success, message, deleted_cwd = delete_session(topic_id, target_name)
 
     if not success:
         await update.message.reply_text(message, parse_mode=ParseMode.MARKDOWN)
         return
 
     # Show new active session info
-    active_name = user_active_session.get(user_id, "?")
-    remaining = len(user_all_sessions.get(user_id, {}))
+    active_name = topic_active_session.get(topic_id, "?")
+    remaining = len(topic_all_sessions.get(topic_id, {}))
     reply = f"{message}\nActive: `{active_name}` | Total: {remaining}"
     msg = await update.message.reply_text(reply, parse_mode=ParseMode.MARKDOWN)
 
@@ -1407,6 +1455,7 @@ async def cmd_delete(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_sync(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /sync - manually trigger memory notebook sync."""
     user_id = update.effective_user.id
+    topic_id = get_topic_id(update)
     group_auth = _check_group_auth(update, is_command=True)
     if group_auth is False:
         return
@@ -1414,8 +1463,8 @@ async def cmd_sync(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     # Use active session's cwd for project detection
-    active_name = user_active_session.get(user_id)
-    sessions = user_all_sessions.get(user_id, {})
+    active_name = topic_active_session.get(topic_id)
+    sessions = topic_all_sessions.get(topic_id, {})
     if active_name and active_name in sessions:
         sid = sessions[active_name]
         cwd = get_session_cwd(sid)
@@ -1456,6 +1505,7 @@ async def cmd_new(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         /new build ~/ashare      - named 'build', cwd = expanded path
     """
     user_id = update.effective_user.id
+    topic_id = get_topic_id(update)
     group_auth = _check_group_auth(update, is_command=True)
     if group_auth is False:
         return
@@ -1484,7 +1534,7 @@ async def cmd_new(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 )
                 return
 
-    new_name, new_sid = create_new_session(user_id, name, cwd=cwd)
+    new_name, new_sid = create_new_session(topic_id, name, cwd=cwd)
     effective = get_session_cwd(new_sid)
     # Show shortened path for display
     display_cwd = effective.replace(os.path.expanduser("~"), "~")
@@ -1504,6 +1554,7 @@ async def cmd_new(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_switch(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /switch <name> - switch to an existing session."""
     user_id = update.effective_user.id
+    topic_id = get_topic_id(update)
     group_auth = _check_group_auth(update, is_command=True)
     if group_auth is False:
         return
@@ -1512,7 +1563,7 @@ async def cmd_switch(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
     if not ctx.args:
         # Show list and hint
-        sessions = list_sessions(user_id)
+        sessions = list_sessions(topic_id)
         if not sessions:
             await update.message.reply_text("No sessions. Send a message to create one.")
             return
@@ -1526,7 +1577,7 @@ async def cmd_switch(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     target = ctx.args[0]
-    sid = switch_session(user_id, target)
+    sid = switch_session(topic_id, target)
     if sid:
         await update.message.reply_text(
             f"Switched to session: `{target}` (`{sid[:8]}...`)",
@@ -1534,7 +1585,7 @@ async def cmd_switch(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         )
     else:
         # Try fuzzy match
-        sessions = user_all_sessions.get(user_id, {})
+        sessions = topic_all_sessions.get(topic_id, {})
         matches = [n for n in sessions if target.lower() in n.lower()]
         if matches:
             hint = ", ".join(f"`{m}`" for m in matches)
@@ -1552,13 +1603,14 @@ async def cmd_switch(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_sessions(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /sessions - list all sessions."""
     user_id = update.effective_user.id
+    topic_id = get_topic_id(update)
     group_auth = _check_group_auth(update, is_command=True)
     if group_auth is False:
         return
     if group_auth is None and not is_authorized(user_id):
         return
 
-    sessions = list_sessions(user_id)
+    sessions = list_sessions(topic_id)
     if not sessions:
         await update.message.reply_text("No sessions yet. Send a message to start one.")
         return
@@ -1588,37 +1640,119 @@ async def cmd_sessions(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /status - show bot status."""
     user_id = update.effective_user.id
+    topic_id = get_topic_id(update)
     group_auth = _check_group_auth(update, is_command=True)
     if group_auth is False:
         return
     if group_auth is None and not is_authorized(user_id):
         return
 
-    active_name = user_active_session.get(user_id, "none")
-    sessions = user_all_sessions.get(user_id, {})
-    busy_sessions = []
-    for name, sid in sessions.items():
-        lock = session_locks.get(sid)
-        if lock and lock.locked():
-            busy_sessions.append(name)
-
     home = os.path.expanduser("~")
-    active_sid = sessions.get(active_name)
+
+    # Count total sessions and busy sessions across all topics
+    total_sessions = 0
+    busy_list = []
+    for tid, sessions in topic_all_sessions.items():
+        for name, sid in sessions.items():
+            total_sessions += 1
+            lock = session_locks.get(sid)
+            if lock and lock.locked():
+                topic_label = f"[T:{tid}]" if tid else "[Private]"
+                busy_list.append(f"{topic_label} {name}")
+
+    # Current topic info
+    current_topic_sessions = topic_all_sessions.get(topic_id, {})
+    active_name = topic_active_session.get(topic_id, "none")
+    active_sid = current_topic_sessions.get(active_name)
     active_cwd = get_session_cwd(active_sid).replace(home, "~") if active_sid else "N/A"
     global_cwd = WORK_DIR.replace(home, "~")
+    topic_label = topic_names.get(topic_id, f"Topic #{topic_id}") if topic_id else "Private chat"
+
     await update.message.reply_text(
         f"Bot Status:\n"
         f"- Running: yes\n"
-        f"- User ID: `{user_id}`\n"
+        f"- Context: {topic_label}\n"
         f"- Active session: `{active_name}`\n"
         f"- Session cwd: `{active_cwd}`\n"
         f"- Global default cwd: `{global_cwd}`\n"
-        f"- Total sessions: {len(sessions)}\n"
-        f"- Busy sessions: {', '.join(f'`{n}`' for n in busy_sessions) if busy_sessions else 'none'}\n"
+        f"- Sessions (this topic): {len(current_topic_sessions)}\n"
+        f"- Sessions (all topics): {total_sessions}\n"
+        f"- Busy: {', '.join(f'`{n}`' for n in busy_list) if busy_list else 'none'}\n"
         f"- Timeout: {CLAUDE_TIMEOUT}s\n"
         f"- Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
         parse_mode=ParseMode.MARKDOWN,
     )
+
+
+async def cmd_topic(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /topic [list|info] - topic management commands.
+
+    Usage:
+        /topic          - show current topic info (alias for /topic info)
+        /topic info     - show current topic info with sessions
+        /topic list     - list all known topics with session counts
+    """
+    user_id = update.effective_user.id
+    topic_id = get_topic_id(update)
+    group_auth = _check_group_auth(update, is_command=True)
+    if group_auth is False:
+        return
+    if group_auth is None and not is_authorized(user_id):
+        return
+
+    subcommand = ctx.args[0].lower() if ctx.args else "info"
+
+    if subcommand == "list":
+        if not topic_all_sessions:
+            await update.message.reply_text("No topics with sessions yet.")
+            return
+        lines = ["📋 All topics with sessions:"]
+        for tid, sessions in sorted(topic_all_sessions.items()):
+            if not sessions:
+                continue
+            active = topic_active_session.get(tid, "?")
+            label = topic_names.get(tid, f"Topic #{tid}") if tid else "Private chat"
+            busy_count = sum(
+                1
+                for sid in sessions.values()
+                if session_locks.get(sid) and session_locks[sid].locked()
+            )
+            marker = " <- you are here" if tid == topic_id else ""
+            lines.append(
+                f"\n  {label}{marker}\n"
+                f"    Sessions: {len(sessions)} | Active: `{active}` | Busy: {busy_count}"
+            )
+            for name, sid in sessions.items():
+                is_active = name == active
+                prefix = "-> " if is_active else "  "
+                lines.append(f"    {prefix}`{name}`")
+        await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+        return
+
+    # info (default)
+    sessions = topic_all_sessions.get(topic_id, {})
+    active_name = topic_active_session.get(topic_id, "none")
+    label = topic_names.get(topic_id, f"Topic #{topic_id}") if topic_id else "Private chat"
+
+    if not sessions:
+        await update.message.reply_text(
+            f"{label}\nNo sessions yet. Send a message to create one."
+        )
+        return
+
+    home = os.path.expanduser("~")
+    lines = [f"📌 {label}\n"]
+    for name, sid in sessions.items():
+        is_active = name == active_name
+        has_context = sid in session_sdk_ids
+        lock = session_locks.get(sid)
+        is_busy = lock.locked() if lock else False
+        status = "BUSY" if is_busy else ("has context" if has_context else "empty")
+        prefix = "-> " if is_active else "  "
+        s_cwd = get_session_cwd(sid).replace(home, "~")
+        lines.append(f"{prefix}`{name}` ({status})\n    📁 `{s_cwd}`")
+    lines.append(f"\nTotal: {len(sessions)}")
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
 
 async def cmd_cd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1632,6 +1766,7 @@ async def cmd_cd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """
     global WORK_DIR
     user_id = update.effective_user.id
+    topic_id = get_topic_id(update)
     group_auth = _check_group_auth(update, is_command=True)
     if group_auth is False:
         return
@@ -1639,8 +1774,8 @@ async def cmd_cd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     # Get current active session
-    active_name = user_active_session.get(user_id)
-    sessions = user_all_sessions.get(user_id, {})
+    active_name = topic_active_session.get(topic_id)
+    sessions = topic_all_sessions.get(topic_id, {})
     active_sid = sessions.get(active_name) if active_name else None
     home = os.path.expanduser("~")
 
@@ -1707,14 +1842,15 @@ async def cmd_cd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_session(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /session - show current session info."""
     user_id = update.effective_user.id
+    topic_id = get_topic_id(update)
     group_auth = _check_group_auth(update, is_command=True)
     if group_auth is False:
         return
     if group_auth is None and not is_authorized(user_id):
         return
 
-    active_name = user_active_session.get(user_id)
-    sessions = user_all_sessions.get(user_id, {})
+    active_name = topic_active_session.get(topic_id)
+    sessions = topic_all_sessions.get(topic_id, {})
     if active_name and active_name in sessions:
         sid = sessions[active_name]
         has_context = sid in session_sdk_ids
@@ -1737,13 +1873,14 @@ async def cmd_session(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_kill(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /kill [session_name] - interrupt a running Claude session."""
     user_id = update.effective_user.id
+    topic_id = get_topic_id(update)
     group_auth = _check_group_auth(update, is_command=True)
     if group_auth is False:
         return
     if group_auth is None and not is_authorized(user_id):
         return
 
-    sessions = user_all_sessions.get(user_id, {})
+    sessions = topic_all_sessions.get(topic_id, {})
     if not sessions:
         await update.message.reply_text("No sessions.")
         return
@@ -1753,7 +1890,7 @@ async def cmd_kill(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         target_name = ctx.args[0]
     else:
         # Default: kill active session
-        target_name = user_active_session.get(user_id)
+        target_name = topic_active_session.get(topic_id)
 
     if not target_name or target_name not in sessions:
         # Show busy sessions as hint
@@ -1791,6 +1928,7 @@ async def cmd_kill(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle file/photo/video uploads - download to server and optionally forward to Claude."""
     user_id = update.effective_user.id
+    topic_id = get_topic_id(update)
     group_auth = _check_group_auth(update)
     if group_auth is False:
         return
@@ -1848,7 +1986,7 @@ async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     caption = msg.caption or ""
     if caption:
         # Resolve session from caption FIRST (before prepending file path)
-        session_name, session_id, resolved_caption = resolve_session_target(user_id, caption)
+        session_name, session_id, resolved_caption = resolve_session_target(topic_id, caption)
         prompt_text = f"File saved to: {save_path}\n\n{resolved_caption}"
         lock = get_session_lock(session_id)
 
@@ -1860,13 +1998,17 @@ async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         async with lock:
             session_pending[session_id] = max(0, session_pending.get(session_id, 1) - 1)
 
-            await msg.chat.send_action(ChatAction.TYPING)
+            await msg.chat.send_action(
+                ChatAction.TYPING,
+                message_thread_id=_thread_id_or_none(topic_id),
+            )
             thinking_msg = await msg.reply_text(f"[{session_name}] Processing file + message...")
 
             response, activity_log = await call_claude(
                 prompt_text, session_id,
                 thinking_msg=thinking_msg, chat=msg.chat,
                 session_name=session_name,
+                topic_id=topic_id,
             )
 
             # Finalize the activity log message (keep it, don't delete)
@@ -1893,7 +2035,7 @@ async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             # Auto-send files/images found in response
             sendable = extract_sendable_files(response)
             if sendable:
-                await send_files_to_chat(msg.chat, sendable, session_name)
+                await send_files_to_chat(msg.chat, sendable, session_name, topic_id)
     else:
         # No caption - just confirm the file was saved
         await msg.reply_text(
@@ -1929,11 +2071,15 @@ async def handle_unknown_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
     CLI built-in commands (/skills, /help, etc.) are intercepted and either
     rewritten to natural language or rejected with a message.
     """
+    user_id = update.effective_user.id
+    topic_id = get_topic_id(update)
+    _ = topic_id
+
     # Group chat: only respond to owner
     group_auth = _check_group_auth(update, is_command=True)
     if group_auth is False:
         return
-    if group_auth is None and not is_authorized(update.effective_user.id):
+    if group_auth is None and not is_authorized(user_id):
         return
 
     text = update.message.text or ""
@@ -1957,6 +2103,7 @@ async def handle_unknown_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle regular text messages - forward to Claude with per-session parallel execution."""
     user_id = update.effective_user.id
+    topic_id = get_topic_id(update)
 
     # Group chat: only respond to owner
     group_auth = _check_group_auth(update)
@@ -1980,24 +2127,11 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text("Answer received.")
         return
 
-    # Check for mid-discussion injection in groups
-    if _is_group_chat(update) and active_discussions:
-        chat_id = update.effective_chat.id
-        for disc in active_discussions.values():
-            if disc.chat_id == chat_id and disc.status == "in_progress":
-                disc.owner_injections.append(text)
-                await update.message.reply_text(
-                    f"💬 Context added to discussion `{disc.discussion_id[:8]}`.\n"
-                    f"Will be included in next round.",
-                    parse_mode=ParseMode.MARKDOWN,
-                )
-                return
-
     # Extract reply context (for cross-bot info transfer in groups)
     reply_context = extract_reply_context(update)
 
     # Resolve target session: supports @session_name prefix
-    session_name, session_id, prompt = resolve_session_target(user_id, text)
+    session_name, session_id, prompt = resolve_session_target(topic_id, text)
 
     # Prepend reply context to prompt if present
     if reply_context:
@@ -2019,7 +2153,10 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
         session_pending[session_id] = max(0, session_pending.get(session_id, 1) - 1)
 
         # Send "typing" indicator
-        await update.message.chat.send_action(ChatAction.TYPING)
+        await update.message.chat.send_action(
+            ChatAction.TYPING,
+            message_thread_id=_thread_id_or_none(topic_id),
+        )
 
         # Send a "working on it" message with session label
         thinking_msg = await update.message.reply_text(f"[{session_name}] Thinking...")
@@ -2029,6 +2166,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
             prompt, session_id,
             thinking_msg=thinking_msg, chat=update.message.chat,
             session_name=session_name,
+            topic_id=topic_id,
         )
 
         # Finalize the activity log message (keep it, don't delete)
@@ -2056,619 +2194,25 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
         # Auto-send files/images found in response
         sendable = extract_sendable_files(response)
         if sendable:
-            await send_files_to_chat(update.message.chat, sendable, session_name)
+            await send_files_to_chat(update.message.chat, sendable, session_name, topic_id)
 
 
-# ─── Shared Directory Bot-to-Bot Communication ──────────────────────────────
-
-import json
-
-# Global reference to Telegram app (used by discussion handlers)
-_telegram_app: Application | None = None
-
-# Active discussions: discussion_id -> DiscussionState
-active_discussions: dict[str, "DiscussionState"] = {}
-
-# Background polling task reference
-_poll_task: asyncio.Task | None = None
-
-
-class DiscussionState:
-    """Tracks state of a bot-to-bot discussion."""
-    def __init__(self, discussion_id: str, topic: str,
-                 initiator_bot: str, responder_bot: str,
-                 chat_id: int, max_rounds: int = 5):
-        self.discussion_id = discussion_id
-        self.topic = topic
-        self.initiator_bot = initiator_bot    # bot username
-        self.responder_bot = responder_bot    # bot username
-        self.chat_id = chat_id               # group chat to post progress
-        self.max_rounds = max_rounds
-        self.current_round = 0
-        self.rounds: list[dict[str, str]] = []
-        self.status = "pending"  # pending|accepted|in_progress|completed|cancelled
-        self.session_id: str | None = None
-        self.owner_injections: list[str] = []
-        self.created_at = time.time()
-        self.initiator_name = ""  # e.g. "@BotA"
-
-
-def _disc_dir(discussion_id: str) -> str:
-    """Get the shared directory path for a discussion."""
-    d = os.path.join(SHARED_DIR, "discussions", discussion_id)
-    os.makedirs(d, exist_ok=True)
-    return d
-
-
-def _write_shared_json(path: str, data: dict) -> None:
-    """Atomically write JSON to a shared file (write-then-rename)."""
-    tmp = path + ".tmp"
-    with open(tmp, "w") as f:
-        json.dump(data, f, ensure_ascii=False)
-    os.replace(tmp, path)
-
-
-def _read_shared_json(path: str) -> dict | None:
-    """Read JSON from a shared file, return None if missing/corrupt."""
-    try:
-        with open(path, "r") as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return None
-
-
-async def _notify_owner(text: str, chat_id: int | None = None) -> None:
-    """Send a notification message to the bot owner."""
-    if not _telegram_app:
-        return
-    target = chat_id or OWNER_USER_ID
-    if not target:
-        return
-    try:
-        await _telegram_app.bot.send_message(target, text, parse_mode=ParseMode.MARKDOWN)
-    except Exception as e:
-        log.warning(f"Failed to notify owner: {e}")
-
-
-async def _send_to_group(chat_id: int, text: str) -> None:
-    """Send a message to a group chat (for discussion progress updates)."""
-    if not _telegram_app:
-        return
-    try:
-        parts = split_message(text)
-        for part in parts:
-            try:
-                await _telegram_app.bot.send_message(chat_id, part, parse_mode=ParseMode.MARKDOWN)
-            except Exception:
-                await _telegram_app.bot.send_message(chat_id, part)
-    except Exception as e:
-        log.warning(f"Failed to send to group {chat_id}: {e}")
-
-
-# ─── Shared directory: write requests/rounds ─────────────────────────────────
-
-
-def _write_discuss_request(state: DiscussionState,
-                           responder_name: str = "") -> None:
-    """Write a discussion request file for the target bot to pick up."""
-    path = os.path.join(SHARED_DIR, "requests", f"{state.discussion_id}.json")
-    _write_shared_json(path, {
-        "discussion_id": state.discussion_id,
-        "topic": state.topic,
-        "initiator_bot": state.initiator_bot,
-        "responder_bot": state.responder_bot,
-        "responder_name": f"@{responder_name}" if responder_name else "",
-        "chat_id": state.chat_id,
-        "max_rounds": state.max_rounds,
-        "initiator_name": state.initiator_name,
-        "status": "pending",
-        "created_at": state.created_at,
-    })
-
-
-def _write_discuss_accept(discussion_id: str) -> None:
-    """Write an accept signal to the discussion directory."""
-    d = _disc_dir(discussion_id)
-    _write_shared_json(os.path.join(d, "accept.json"), {
-        "discussion_id": discussion_id,
-        "accepted_by": BOT_USERNAME,
-        "timestamp": time.time(),
-    })
-
-
-def _write_discuss_reject(discussion_id: str) -> None:
-    """Write a reject signal to the discussion directory."""
-    d = _disc_dir(discussion_id)
-    _write_shared_json(os.path.join(d, "reject.json"), {
-        "discussion_id": discussion_id,
-        "rejected_by": BOT_USERNAME,
-        "timestamp": time.time(),
-    })
-
-
-def _write_discuss_round(discussion_id: str, round_number: int,
-                         sender: str, content: str) -> None:
-    """Write a discussion round file for the other bot to pick up."""
-    d = _disc_dir(discussion_id)
-    path = os.path.join(d, f"round_{round_number}.json")
-    _write_shared_json(path, {
-        "discussion_id": discussion_id,
-        "round_number": round_number,
-        "sender": sender,
-        "content": content,
-        "timestamp": time.time(),
-    })
-
-
-def _write_discuss_cancel(discussion_id: str) -> None:
-    """Write a cancel marker to the discussion directory."""
-    d = _disc_dir(discussion_id)
-    _write_shared_json(os.path.join(d, "cancel.json"), {
-        "discussion_id": discussion_id,
-        "cancelled_by": BOT_USERNAME,
-        "timestamp": time.time(),
-    })
-
-
-async def _process_discussion_round(state: DiscussionState) -> None:
-    """Process a received discussion round by generating this bot's response.
-
-    Called as a background task when a round is received via API.
-    """
-    state.status = "in_progress"
-
-    # Build prompt for Claude with full discussion context
-    prompt_parts = [
-        f"You are participating in a structured discussion about: {state.topic}",
-        f"This is round {state.current_round + 1} of {state.max_rounds}.",
-        "",
-        "Discussion so far:",
-    ]
-
-    for i, round_data in enumerate(state.rounds):
-        prompt_parts.append(f"[Round {i+1} - {round_data['role']}]: {round_data['content']}")
-
-    # Include any owner injections
-    if state.owner_injections:
-        prompt_parts.append("\nAdditional context from your owner:")
-        for injection in state.owner_injections:
-            prompt_parts.append(f"  - {injection}")
-        state.owner_injections.clear()
-
-    if state.current_round + 1 >= state.max_rounds:
-        prompt_parts.append(
-            "\nThis is the FINAL round. Provide a clear conclusion or summary "
-            "of the discussion, highlighting areas of agreement and disagreement."
-        )
-    else:
-        prompt_parts.append(
-            "\nProvide your response for this round. Be constructive and "
-            "build on the previous points."
-        )
-
-    prompt = "\n".join(prompt_parts)
-
-    # Create or reuse a dedicated session for this discussion
-    if not state.session_id:
-        state.session_id = str(uuid.uuid4())
-
-    # Call Claude
-    response, activity_log = await call_claude(
-        prompt, state.session_id,
-        session_name=f"discuss-{state.discussion_id[:6]}",
-    )
-
-    # Post progress to group chat
-    round_num = state.current_round + 1
-    await _send_to_group(
-        state.chat_id,
-        f"**[@{BOT_USERNAME} — Round {round_num}/{state.max_rounds}]**\n{response}"
-    )
-
-    # Record our response
-    state.rounds.append({
-        "role": f"@{BOT_USERNAME}",
-        "content": response,
-    })
-    state.current_round = round_num
-
-    # Check if discussion is complete
-    if state.current_round >= state.max_rounds:
-        state.status = "completed"
-        await _send_to_group(
-            state.chat_id,
-            f"✅ Discussion '{state.topic}' completed after {state.max_rounds} rounds."
-        )
-        # Cleanup after a short delay
-        await asyncio.sleep(10)
-        active_discussions.pop(state.discussion_id, None)
-        return
-
-    # Write our response to shared directory for the other bot to pick up
-    _write_discuss_round(
-        state.discussion_id, state.current_round,
-        f"@{BOT_USERNAME}", response,
-    )
-
-
-async def _start_discussion_as_initiator(state: DiscussionState) -> None:
-    """Generate and send the first round of discussion as the initiator."""
-    state.status = "in_progress"
-
-    prompt = (
-        f"You are initiating a structured discussion about: {state.topic}\n"
-        f"This is round 1 of {state.max_rounds}.\n\n"
-        f"Present your initial analysis and viewpoint on the topic. "
-        f"Be thorough but concise."
-    )
-
-    if not state.session_id:
-        state.session_id = str(uuid.uuid4())
-
-    response, _ = await call_claude(
-        prompt, state.session_id,
-        session_name=f"discuss-{state.discussion_id[:6]}",
-    )
-
-    # Post to group
-    await _send_to_group(
-        state.chat_id,
-        f"**[@{BOT_USERNAME} — Round 1/{state.max_rounds}]**\n{response}"
-    )
-
-    state.rounds.append({
-        "role": f"@{BOT_USERNAME}",
-        "content": response,
-    })
-    state.current_round = 1
-
-    if state.max_rounds <= 1:
-        state.status = "completed"
-        await _send_to_group(state.chat_id,
-                             f"✅ Discussion '{state.topic}' completed.")
-        await asyncio.sleep(10)
-        active_discussions.pop(state.discussion_id, None)
-        return
-
-    # Write first round to shared directory for responder to pick up
-    _write_discuss_round(
-        state.discussion_id, 1,
-        f"@{BOT_USERNAME}", response,
-    )
-
-
-async def _poll_shared_directory() -> None:
-    """Background task: poll the shared directory for new requests, accepts, rounds, etc.
-
-    Runs every SHARED_POLL_INTERVAL seconds. Checks:
-    1. New discussion requests (requests/{id}.json)
-    2. Accept/reject signals (discussions/{id}/accept.json, reject.json)
-    3. New discussion rounds (discussions/{id}/round_{N}.json)
-    4. Cancel signals (discussions/{id}/cancel.json)
-    """
-    if not SHARED_DIR:
-        return
-
-    log.info(f"Shared directory poller started (interval={SHARED_POLL_INTERVAL}s)")
-    requests_dir = os.path.join(SHARED_DIR, "requests")
-    discussions_dir = os.path.join(SHARED_DIR, "discussions")
-
-    # Track which files we've already processed to avoid re-processing
-    processed_files: set[str] = set()
-
-    while True:
-        try:
-            await asyncio.sleep(SHARED_POLL_INTERVAL)
-
-            # 1. Check for new discussion requests targeted at this bot
-            if os.path.isdir(requests_dir):
-                for fname in os.listdir(requests_dir):
-                    fpath = os.path.join(requests_dir, fname)
-                    if fpath in processed_files:
-                        continue
-                    data = _read_shared_json(fpath)
-                    if not data:
-                        continue
-                    # Only process requests targeted at this bot
-                    responder = data.get("responder_name", "").lstrip("@").lower()
-                    if responder != BOT_USERNAME.lower():
-                        continue
-
-                    processed_files.add(fpath)
-                    discussion_id = data["discussion_id"]
-
-                    state = DiscussionState(
-                        discussion_id=discussion_id,
-                        topic=data["topic"],
-                        initiator_bot=data.get("initiator_bot", ""),
-                        responder_bot=f"@{BOT_USERNAME}",
-                        chat_id=data["chat_id"],
-                        max_rounds=data.get("max_rounds", 5),
-                    )
-                    state.initiator_name = data.get("initiator_name", "Unknown bot")
-                    active_discussions[discussion_id] = state
-
-                    # Notify owner in group chat
-                    await _notify_owner(
-                        f"📩 Discussion request from {state.initiator_name}:\n"
-                        f"Topic: _{state.topic}_\n"
-                        f"Max rounds: {state.max_rounds}\n\n"
-                        f"`/accept {discussion_id}`\n"
-                        f"`/reject {discussion_id}`",
-                        chat_id=state.chat_id,
-                    )
-                    log.info(f"Received discussion request {discussion_id} "
-                             f"from {state.initiator_name}")
-
-            # 2. Check for accept/reject/cancel signals and new rounds
-            for did, state in list(active_discussions.items()):
-                disc_dir = _disc_dir(did)
-                if not os.path.isdir(disc_dir):
-                    continue
-
-                # Check accept signal (initiator watches for this)
-                accept_path = os.path.join(disc_dir, "accept.json")
-                if (accept_path not in processed_files
-                        and os.path.exists(accept_path)):
-                    processed_files.add(accept_path)
-                    if state.status in ("pending", "requesting"):
-                        state.status = "accepted"
-                        log.info(f"Discussion {did} accepted")
-                        asyncio.create_task(
-                            _start_discussion_as_initiator(state))
-
-                # Check reject signal
-                reject_path = os.path.join(disc_dir, "reject.json")
-                if (reject_path not in processed_files
-                        and os.path.exists(reject_path)):
-                    processed_files.add(reject_path)
-                    state.status = "rejected"
-                    await _send_to_group(
-                        state.chat_id,
-                        f"❌ Discussion '{state.topic}' was rejected.")
-                    active_discussions.pop(did, None)
-                    continue
-
-                # Check cancel signal
-                cancel_path = os.path.join(disc_dir, "cancel.json")
-                if (cancel_path not in processed_files
-                        and os.path.exists(cancel_path)):
-                    processed_files.add(cancel_path)
-                    state.status = "cancelled"
-                    await _send_to_group(
-                        state.chat_id,
-                        f"❌ Discussion '{state.topic}' cancelled.")
-                    active_discussions.pop(did, None)
-                    continue
-
-                # Check for new rounds (only process rounds from the OTHER bot)
-                if state.status not in ("in_progress", "accepted"):
-                    continue
-
-                expected_round = state.current_round + 1
-                round_path = os.path.join(
-                    disc_dir, f"round_{expected_round}.json")
-                if (round_path not in processed_files
-                        and os.path.exists(round_path)):
-                    round_data = _read_shared_json(round_path)
-                    if round_data:
-                        sender = round_data.get("sender", "")
-                        # Only process rounds from the OTHER bot
-                        if sender.lstrip("@").lower() != BOT_USERNAME.lower():
-                            processed_files.add(round_path)
-                            state.rounds.append({
-                                "role": sender,
-                                "content": round_data["content"],
-                            })
-                            state.current_round = round_data["round_number"]
-                            log.info(f"Discussion {did}: received round "
-                                     f"{state.current_round} from {sender}")
-                            asyncio.create_task(
-                                _process_discussion_round(state))
-
-        except asyncio.CancelledError:
-            log.info("Shared directory poller stopped")
-            return
-        except Exception as e:
-            log.error(f"Error in shared directory poller: {e}", exc_info=True)
-            await asyncio.sleep(5)  # back off on error
+# ─── Lifecycle callbacks ─────────────────────────────────────────────────────
 
 
 async def post_init(application: Application) -> None:
-    """Post-init callback: set bot username and start shared directory poller."""
-    global _telegram_app, _poll_task, BOT_USERNAME
-
-    _telegram_app = application
-
-    # Set bot username dynamically
+    """Post-init callback: set bot username."""
+    global BOT_USERNAME
     me = await application.bot.get_me()
     BOT_USERNAME = me.username or ""
     log.info(f"Bot username: @{BOT_USERNAME}")
-
     if OWNER_USER_ID:
         log.info(f"Owner user ID: {OWNER_USER_ID}")
 
-    if SHARED_DIR:
-        log.info(f"Shared directory: {SHARED_DIR}")
-        _poll_task = asyncio.create_task(_poll_shared_directory())
-    else:
-        log.info("GROUP_SHARED_DIR not set, shared directory polling disabled")
-
 
 async def post_shutdown(application: Application) -> None:
-    """Post-shutdown callback: stop shared directory poller."""
-    global _poll_task
-    if _poll_task and not _poll_task.done():
-        _poll_task.cancel()
-        try:
-            await _poll_task
-        except asyncio.CancelledError:
-            pass
-        log.info("Shared directory poller cleaned up")
-
-
-# ─── Discussion commands ─────────────────────────────────────────────────────
-
-
-async def cmd_propose(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /propose @BotB 'topic' [rounds] - initiate a discussion with another bot.
-
-    Usage:
-        /propose @BotB "Should we refactor the auth module?" 5
-        /propose @BotB "Review the API changes"
-    """
-    user_id = update.effective_user.id
-    group_auth = _check_group_auth(update, is_command=True)
-    if group_auth is False:
-        return
-    if group_auth is None and not is_authorized(user_id):
-        return
-
-    if not SHARED_DIR:
-        await update.message.reply_text(
-            "⚠️ Shared directory not configured. Set GROUP_SHARED_DIR in env.")
-        return
-
-    if not ctx.args or len(ctx.args) < 2:
-        await update.message.reply_text(
-            "Usage: `/propose @BotName topic [max_rounds]`\n"
-            "Example: `/propose @ClaudeBot2 'Review auth changes' 5`",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-        return
-
-    target_bot = ctx.args[0].lstrip("@")
-
-    # Parse topic (remaining args, possibly quoted) and optional max_rounds at end
-    remaining = " ".join(ctx.args[1:])
-    max_rounds = 5
-    parts = remaining.rsplit(" ", 1)
-    if len(parts) == 2 and parts[1].isdigit():
-        max_rounds = int(parts[1])
-        remaining = parts[0]
-    topic = remaining.strip("'\"")
-
-    # Create discussion
-    discussion_id = str(uuid.uuid4())[:12]
-    chat_id = update.effective_chat.id
-
-    state = DiscussionState(
-        discussion_id=discussion_id,
-        topic=topic,
-        initiator_bot=f"@{BOT_USERNAME}",
-        responder_bot=f"@{target_bot}",
-        chat_id=chat_id,
-        max_rounds=max_rounds,
-    )
-    state.status = "pending"
-    state.initiator_name = f"@{BOT_USERNAME}"
-    active_discussions[discussion_id] = state
-
-    # Write request to shared directory (target bot's poller will pick it up)
-    _write_discuss_request(state, responder_name=target_bot)
-
-    await update.message.reply_text(
-        f"📤 Discussion request sent to `@{target_bot}`.\n"
-        f"Topic: _{topic}_\n"
-        f"Max rounds: {max_rounds}\n"
-        f"Waiting for acceptance...",
-        parse_mode=ParseMode.MARKDOWN,
-    )
-
-
-async def cmd_accept(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /accept [discussion_id] - accept a pending discussion request."""
-    user_id = update.effective_user.id
-    group_auth = _check_group_auth(update, is_command=True)
-    if group_auth is False:
-        return
-    if group_auth is None and not is_authorized(user_id):
-        return
-
-    # Find pending discussion
-    if ctx.args:
-        discussion_id = ctx.args[0]
-    else:
-        pending = [d for d in active_discussions.values() if d.status == "pending"]
-        if not pending:
-            await update.message.reply_text("No pending discussion requests.")
-            return
-        discussion_id = pending[-1].discussion_id
-
-    state = active_discussions.get(discussion_id)
-    if not state or state.status != "pending":
-        await update.message.reply_text(
-            f"Discussion `{discussion_id}` not found or not pending.",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-        return
-
-    state.status = "accepted"
-
-    # Write accept signal to shared directory (initiator's poller will pick it up)
-    _write_discuss_accept(discussion_id)
-
-    await update.message.reply_text(
-        f"✅ Discussion accepted!\n"
-        f"Topic: _{state.topic}_\n"
-        f"Waiting for {state.initiator_name} to start round 1...",
-        parse_mode=ParseMode.MARKDOWN,
-    )
-
-
-async def cmd_reject(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /reject [discussion_id] - reject a pending discussion request."""
-    user_id = update.effective_user.id
-    group_auth = _check_group_auth(update, is_command=True)
-    if group_auth is False:
-        return
-    if group_auth is None and not is_authorized(user_id):
-        return
-
-    if ctx.args:
-        discussion_id = ctx.args[0]
-    else:
-        pending = [d for d in active_discussions.values() if d.status == "pending"]
-        if not pending:
-            await update.message.reply_text("No pending discussion requests.")
-            return
-        discussion_id = pending[-1].discussion_id
-
-    state = active_discussions.pop(discussion_id, None)
-    if not state:
-        await update.message.reply_text("Discussion not found.")
-        return
-
-    # Write reject signal to shared directory
-    _write_discuss_reject(discussion_id)
-
-    await update.message.reply_text(
-        f"❌ Discussion rejected: _{state.topic}_",
-        parse_mode=ParseMode.MARKDOWN,
-    )
-
-
-async def cmd_discussions(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /discussions - list active discussions."""
-    user_id = update.effective_user.id
-    group_auth = _check_group_auth(update, is_command=True)
-    if group_auth is False:
-        return
-    if group_auth is None and not is_authorized(user_id):
-        return
-
-    if not active_discussions:
-        await update.message.reply_text("No active discussions.")
-        return
-
-    lines = ["Active discussions:"]
-    for did, state in active_discussions.items():
-        lines.append(
-            f"  `{did}` — _{state.topic}_\n"
-            f"    Status: {state.status} | "
-            f"Round: {state.current_round}/{state.max_rounds}"
-        )
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+    """Post-shutdown callback."""
+    pass
 
 
 # ─── Main ────────────────────────────────────────────────────────────────────
@@ -2704,11 +2248,7 @@ def main():
     app.add_handler(CommandHandler("kill", cmd_kill))
     app.add_handler(CommandHandler("delete", cmd_delete))
     app.add_handler(CommandHandler("sync", cmd_sync))
-    # Discussion commands
-    app.add_handler(CommandHandler("propose", cmd_propose))
-    app.add_handler(CommandHandler("accept", cmd_accept))
-    app.add_handler(CommandHandler("reject", cmd_reject))
-    app.add_handler(CommandHandler("discussions", cmd_discussions))
+    app.add_handler(CommandHandler("topic", cmd_topic))
     # AskUserQuestion callback handler (must be before general message handler)
     app.add_handler(CallbackQueryHandler(handle_ask_callback, pattern=r"^ask:"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
