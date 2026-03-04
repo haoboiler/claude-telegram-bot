@@ -9,6 +9,7 @@ including AskUserQuestion support via Telegram inline keyboards.
 
 import argparse
 import asyncio
+import json
 import logging
 import os
 import re
@@ -347,6 +348,144 @@ def get_session_cwd(session_id: str) -> str:
     return session_work_dirs.get(session_id, WORK_DIR)
 
 
+def _derive_project_slug(cwd: str) -> str:
+    """Derive the Claude CLI project slug from a working directory path.
+
+    The Claude CLI stores session JSONL files at:
+        ~/.claude/projects/{slug}/{session_uuid}.jsonl
+    where slug is the absolute path with / and _ replaced by -.
+    """
+    cwd = os.path.realpath(cwd)
+    return cwd.replace("/", "-").replace("_", "-")
+
+
+def read_session_history(cwd: str, sdk_session_id: str,
+                         n: int = 5) -> list[dict]:
+    """Read the last N conversation turns from a Claude CLI session JSONL file.
+
+    Args:
+        cwd: Working directory of the session (for deriving project slug).
+        sdk_session_id: The SDK session UUID.
+        n: Number of assistant messages to retrieve.
+
+    Returns:
+        List of dicts with role ("user"/"assistant") and content data.
+
+    Raises:
+        FileNotFoundError: If the JSONL file doesn't exist.
+        ValueError: If no conversation data found.
+    """
+    slug = _derive_project_slug(cwd)
+    jsonl_path = os.path.expanduser(
+        f"~/.claude/projects/{slug}/{sdk_session_id}.jsonl")
+
+    if not os.path.isfile(jsonl_path):
+        raise FileNotFoundError(jsonl_path)
+
+    turns: list[dict] = []
+
+    with open(jsonl_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            rec_type = record.get("type")
+
+            if rec_type == "user":
+                msg = record.get("message", {})
+                content = msg.get("content", "")
+                if isinstance(content, str):
+                    turns.append({"role": "user", "text": content})
+                else:
+                    # tool_result or structured content
+                    parts = []
+                    for block in content:
+                        if isinstance(block, dict):
+                            if block.get("type") == "tool_result":
+                                parts.append("[tool result]")
+                            elif block.get("type") == "text":
+                                parts.append(block.get("text", ""))
+                    turns.append({
+                        "role": "user",
+                        "text": " ".join(parts) if parts else "[structured input]",
+                    })
+
+            elif rec_type == "assistant":
+                msg = record.get("message", {})
+                content_blocks = msg.get("content", [])
+                formatted_blocks = []
+
+                for block in content_blocks:
+                    btype = block.get("type")
+                    if btype == "text":
+                        text = block.get("text", "")
+                        if text:
+                            formatted_blocks.append(("text", text))
+                    elif btype == "tool_use":
+                        name = block.get("name", "?")
+                        inp = block.get("input", {})
+                        summary = _format_tool_use_from_dict(name, inp)
+                        formatted_blocks.append(("tool", summary))
+                    # Skip "thinking" blocks
+
+                if formatted_blocks:
+                    turns.append({"role": "assistant", "blocks": formatted_blocks})
+
+    if not turns:
+        raise ValueError("No conversation data found in session file.")
+
+    # Collect last N assistant turns with their preceding user messages
+    result = []
+    assistant_count = 0
+
+    for i in range(len(turns) - 1, -1, -1):
+        if turns[i]["role"] == "assistant":
+            assistant_count += 1
+            if assistant_count > n:
+                break
+            # Include preceding user message if it exists
+            if i > 0 and turns[i - 1]["role"] == "user":
+                result.append(turns[i - 1])
+            result.append(turns[i])
+
+    result.reverse()
+    return result
+
+
+def format_history_message(turns: list[dict], session_name: str,
+                           n: int) -> str:
+    """Format history turns into a Telegram-friendly plain-text message."""
+    lines = [f"📜 History [{session_name}] (last {n} assistant messages):\n"]
+
+    for turn in turns:
+        if turn["role"] == "user":
+            text = turn.get("text", "")
+            # Skip tool_result user messages
+            if text in ("[tool result]", "[structured input]"):
+                continue
+            if len(text) > 200:
+                text = text[:200] + "..."
+            lines.append(f">> {text}\n")
+
+        elif turn["role"] == "assistant":
+            blocks = turn.get("blocks", [])
+            for btype, content in blocks:
+                if btype == "text":
+                    if len(content) > 500:
+                        content = content[:500] + "..."
+                    lines.append(content)
+                elif btype == "tool":
+                    lines.append(f"  🔧 {content}")
+            lines.append("")  # blank separator
+
+    return "\n".join(lines)
+
+
 def get_or_create_session(topic_id: int) -> str:
     """Get existing session or create a new one. Returns local_session_id."""
     if topic_id not in topic_all_sessions:
@@ -679,6 +818,12 @@ def should_respond_in_group(update: Update, is_command: bool = False) -> bool:
     if not msg:
         return False
 
+    # Forum topic mode: owner's messages in a topic always get a response.
+    # Topics provide namespace isolation (replacing the need for @mention).
+    # This is the personal-use scenario: one user + one bot in a topic group.
+    if getattr(msg, "is_topic_message", False) and msg.message_thread_id:
+        return True
+
     # Check @mention of this bot in message text
     if msg.text and BOT_USERNAME:
         if f"@{BOT_USERNAME}" in msg.text:
@@ -817,6 +962,29 @@ def _extract_activity(msg) -> Optional[str]:
                 return "Thinking..."
 
     return None
+
+
+def _format_tool_use_from_dict(name: str, inp: dict) -> str:
+    """Format a tool_use block from JSONL dict into a human-readable summary.
+
+    Same logic as _extract_activity() but works on raw dict data from JSONL
+    files rather than SDK dataclass objects.
+    """
+    label = TOOL_LABELS.get(name, name)
+    if name in ("Read", "Edit", "Write") and "file_path" in inp:
+        short = inp["file_path"].split("/")[-1]
+        return f"{label} {short}"
+    elif name == "Bash" and "command" in inp:
+        cmd = inp["command"][:60]
+        return f"{label}: {cmd}"
+    elif name == "Grep" and "pattern" in inp:
+        return f"{label} '{inp['pattern'][:40]}'"
+    elif name == "Glob" and "pattern" in inp:
+        return f"{label} {inp['pattern'][:40]}"
+    elif name in ("Task", "Agent"):
+        desc = inp.get("description", "")[:40]
+        return f"{label}: {desc}" if desc else label
+    return label
 
 
 async def _update_thinking_msg(thinking_msg, activity_log: list[str],
@@ -1044,6 +1212,7 @@ async def call_claude(prompt: str, session_id: str,
 
         activity_log: list[str] = []
         result_text = ""
+        last_assistant_text = ""  # Fallback: last TextBlock from AssistantMessage
         actual_session_id = None
         start_time = time.time()
         last_edit_time = 0.0
@@ -1068,6 +1237,12 @@ async def call_claude(prompt: str, session_id: str,
             activity = _extract_activity(msg)
             if activity and (not activity_log or activity_log[-1] != activity):
                 activity_log.append(activity)
+
+            # Capture last assistant text as fallback for empty ResultMessage
+            if isinstance(msg, AssistantMessage):
+                for block in msg.content:
+                    if isinstance(block, TextBlock) and block.text:
+                        last_assistant_text = block.text
 
             # Throttled update of thinking_msg
             if thinking_msg and activity and (now - last_edit_time) >= EDIT_THROTTLE:
@@ -1115,7 +1290,8 @@ async def call_claude(prompt: str, session_id: str,
         if actual_session_id:
             session_sdk_ids[session_id] = actual_session_id
 
-        return result_text or "[Task completed but no summary was produced.]", activity_log
+        return (result_text or last_assistant_text
+                or "[Task completed but no summary was produced.]"), activity_log
 
     except CLINotFoundError:
         return "Error: claude CLI not found. Make sure it's installed.", []
@@ -1923,6 +2099,116 @@ async def cmd_kill(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         )
     except Exception as e:
         await update.message.reply_text(f"Failed to interrupt: {e}")
+
+
+async def cmd_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /history [N] [session_name] - show recent session conversation.
+
+    Usage:
+        /history              - last 5 assistant messages of active session
+        /history 10           - last 10 assistant messages of active session
+        /history 10 ashare    - last 10 assistant messages of 'ashare' session
+        /history ashare       - last 5 assistant messages of 'ashare' session
+    """
+    user_id = update.effective_user.id
+    topic_id = get_topic_id(update)
+    group_auth = _check_group_auth(update, is_command=True)
+    if group_auth is False:
+        return
+    if group_auth is None and not is_authorized(user_id):
+        return
+
+    # Parse arguments: /history [N] [session_name]
+    n = 5
+    target_name = None
+
+    if ctx.args:
+        first = ctx.args[0]
+        if first.isdigit():
+            n = int(first)
+            n = max(1, min(n, 50))  # Clamp to 1-50
+            if len(ctx.args) >= 2:
+                target_name = ctx.args[1]
+        else:
+            target_name = first
+            if len(ctx.args) >= 2 and ctx.args[1].isdigit():
+                n = int(ctx.args[1])
+                n = max(1, min(n, 50))
+
+    # Resolve target session
+    sessions = topic_all_sessions.get(topic_id, {})
+    if not sessions:
+        await update.message.reply_text("No sessions. Send a message to create one.")
+        return
+
+    if target_name:
+        if target_name not in sessions:
+            # Fuzzy match
+            matches = [nm for nm in sessions if target_name.lower() in nm.lower()]
+            if matches:
+                hint = ", ".join(f"`{m}`" for m in matches)
+                await update.message.reply_text(
+                    f"Session `{target_name}` not found. Did you mean: {hint}?",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+            else:
+                available = ", ".join(f"`{nm}`" for nm in sorted(sessions.keys()))
+                await update.message.reply_text(
+                    f"Session `{target_name}` not found.\nAvailable: {available}",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+            return
+        session_name = target_name
+        session_id = sessions[target_name]
+    else:
+        session_name = topic_active_session.get(topic_id)
+        if not session_name or session_name not in sessions:
+            await update.message.reply_text("No active session.")
+            return
+        session_id = sessions[session_name]
+
+    # Check for SDK session ID
+    sdk_sid = session_sdk_ids.get(session_id)
+    if not sdk_sid:
+        await update.message.reply_text(
+            f"Session `{session_name}` has no conversation history yet.\n"
+            f"Send a message first to start a conversation.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    # Get session cwd and read history
+    cwd = get_session_cwd(session_id)
+
+    try:
+        turns = read_session_history(cwd, sdk_sid, n)
+        output = format_history_message(turns, session_name, n)
+    except FileNotFoundError as e:
+        await update.message.reply_text(
+            f"Session file not found for `{session_name}`.\n"
+            f"Path: `{e}`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    except ValueError as e:
+        await update.message.reply_text(
+            f"No history found for `{session_name}`: {e}",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    except Exception as e:
+        log.exception(f"Error reading history for {session_name}")
+        await update.message.reply_text(f"Error reading history: {e}")
+        return
+
+    # Send via split_message (plain text to avoid Markdown escaping issues)
+    parts = split_message(output)
+    for part in parts:
+        try:
+            await update.message.reply_text(part)
+        except Exception:
+            # Fallback: truncate if even plain text fails
+            await update.message.reply_text(part[:TG_MAX_LEN])
 
 
 async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
