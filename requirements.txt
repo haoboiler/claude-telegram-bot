@@ -1,3 +1,7 @@
 python-telegram-bot>=21.0
 python-dotenv>=1.0.0
 claude-agent-sdk>=0.1.44
+PyYAML>=6.0
+
+# Development / testing
+pytest>=7.0
