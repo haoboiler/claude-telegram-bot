@@ -68,6 +68,8 @@ No test suite or linter is configured.
 | `STALL_WARN_TIMEOUT` | 300 | Seconds before stall warning |
 | `CLAUDE_MAX_TURNS` | 150 | Max agentic turns per call |
 | `UPLOAD_DIR` | `$CLAUDE_WORK_DIR/uploads` | Where uploaded files are saved |
+| `SESSION_REPO_BACKEND` | `memory` | Session store backend (`memory` or `sqlite`) |
+| `SESSION_REPO_SQLITE_PATH` | `.sessions.sqlite` (or `instances/<name>.sessions.sqlite`) | SQLite path when backend is `sqlite` |
 
 ## Important Implementation Details
 

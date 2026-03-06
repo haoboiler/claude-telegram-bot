@@ -59,6 +59,8 @@ cp .env.example .env
 | `STALL_WARN_TIMEOUT` | `300` | Warn (not kill) if no output for N seconds |
 | `CLAUDE_MAX_TURNS` | `150` | Max agentic turns per call |
 | `UPLOAD_DIR` | `WORK_DIR/uploads` | Directory for files uploaded via Telegram |
+| `SESSION_REPO_BACKEND` | `memory` | Session store backend: `memory` or `sqlite` |
+| `SESSION_REPO_SQLITE_PATH` | `.sessions.sqlite` (or `instances/<name>.sessions.sqlite`) | SQLite path when `SESSION_REPO_BACKEND=sqlite` |
 
 ### 4. Run
 
