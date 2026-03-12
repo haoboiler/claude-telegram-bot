@@ -110,6 +110,7 @@ class ClaudeGateway:
                 self.make_can_use_tool(chat, session_name, topic_id) if chat else None
             ),
             setting_sources=["user", "project"],
+            max_buffer_size=3_145_728,  # 3MB – prevent SDK JSON decode errors on large responses
         )
 
         sdk_sid = self.session_sdk_ids.get(session_id)

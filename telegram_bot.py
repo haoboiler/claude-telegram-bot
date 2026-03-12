@@ -8,9 +8,12 @@ including AskUserQuestion support via Telegram inline keyboards.
 """
 
 import asyncio
+import atexit
 import logging
 import os
 import re
+import signal
+import subprocess
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -152,8 +155,145 @@ SESSION_REPO_SQLITE_PATH = os.environ.get(
     _DEFAULT_SQLITE_REPO_PATH,
 )
 
+# SSH SOCKS proxy relay for Telegram API (optional).
+# Set to an SSH host alias (e.g. "aws-proxy") to tunnel all Telegram traffic
+# through that host via SOCKS5. Leave empty to connect directly.
+SSH_PROXY_RELAY = os.environ.get("SSH_PROXY_RELAY", "").strip()
+_SOCKS_PROXY_URL: Optional[str] = None
+
+
+class _SSHTunnelManager:
+    """Manages an SSH SOCKS5 tunnel with automatic restart on failure."""
+
+    def __init__(self, relay_host: str, local_port: int):
+        self.relay_host = relay_host
+        self.local_port = local_port
+        self.process: Optional[subprocess.Popen] = None
+        self._lock = __import__("threading").Lock()
+
+    @property
+    def ssh_cmd(self) -> list[str]:
+        return [
+            "ssh", "-o", "ConnectTimeout=10",
+            "-o", "ServerAliveInterval=15",
+            "-o", "ServerAliveCountMax=3",
+            "-o", "ExitOnForwardFailure=yes",
+            "-N", "-D", f"127.0.0.1:{self.local_port}",
+            self.relay_host,
+        ]
+
+    def start(self) -> None:
+        with self._lock:
+            if self.process and self.process.poll() is None:
+                return
+            self.process = subprocess.Popen(
+                self.ssh_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+            )
+            # Wait for SSH handshake to complete; check periodically
+            import time as _time
+            for _ in range(10):
+                _time.sleep(0.5)
+                if self.process.poll() is not None:
+                    stderr = self.process.stderr.read().decode() if self.process.stderr else ""
+                    raise RuntimeError(
+                        f"SSH tunnel to {self.relay_host} failed: {stderr}"
+                    )
+                # Verify the port is actually listening
+                import socket as _sock_mod
+                try:
+                    with _sock_mod.create_connection(("127.0.0.1", self.local_port), timeout=0.3):
+                        return  # tunnel is ready
+                except OSError:
+                    continue
+            # If we get here, tunnel process is alive but port not ready
+            raise RuntimeError(
+                f"SSH tunnel to {self.relay_host}: port {self.local_port} not ready after 5s"
+            )
+
+    def ensure_alive(self) -> None:
+        """Restart tunnel if it has died."""
+        with self._lock:
+            if self.process and self.process.poll() is None:
+                return
+        # Log outside lock to avoid import-time issues
+        _tunnel_log = __import__("logging").getLogger("claude-tg-bot")
+        _tunnel_log.warning("SSH proxy tunnel died, restarting...")
+        self.start()
+        _tunnel_log.info(f"SSH tunnel restarted (pid: {self.process.pid})")
+
+    def stop(self) -> None:
+        with self._lock:
+            if self.process and self.process.poll() is None:
+                self.process.terminate()
+                try:
+                    self.process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self.process.kill()
+
+
+_ssh_tunnel: Optional[_SSHTunnelManager] = None
+
+if SSH_PROXY_RELAY:
+    import socket as _socket
+    _sock = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+    _sock.bind(("127.0.0.1", 0))
+    _socks_port = _sock.getsockname()[1]
+    _sock.close()
+
+    _ssh_tunnel = _SSHTunnelManager(SSH_PROXY_RELAY, _socks_port)
+    _ssh_tunnel.start()
+    _SOCKS_PROXY_URL = f"socks5://127.0.0.1:{_socks_port}"
+
+    atexit.register(_ssh_tunnel.stop)
+
+    _original_sigterm = signal.getsignal(signal.SIGTERM)
+    def _sigterm_handler(signum, frame):
+        _ssh_tunnel.stop()
+        if callable(_original_sigterm) and _original_sigterm not in (signal.SIG_DFL, signal.SIG_IGN):
+            _original_sigterm(signum, frame)
+        else:
+            raise SystemExit(0)
+    signal.signal(signal.SIGTERM, _sigterm_handler)
+
 # Telegram message max length
 TG_MAX_LEN = 4000
+
+# ─── Network retry helper (for SSH tunnel resilience) ────────────────────────
+
+_TG_SEND_MAX_RETRIES = 3
+_TG_SEND_RETRY_DELAY = 2.0  # seconds between retries
+
+
+async def _tg_retry(coro_factory, retries=_TG_SEND_MAX_RETRIES):
+    """
+    Call a Telegram API coroutine with retry on NetworkError.
+
+    Usage:
+        msg = await _tg_retry(lambda: update.message.reply_text("hello"))
+
+    If SSH tunnel is configured and a NetworkError occurs, ensures the tunnel
+    is alive before retrying.
+    """
+    from telegram.error import NetworkError
+    last_exc = None
+    for attempt in range(1, retries + 1):
+        try:
+            return await coro_factory()
+        except NetworkError as e:
+            last_exc = e
+            if attempt == retries:
+                raise
+            _retry_log = __import__("logging").getLogger("claude-tg-bot")
+            _retry_log.warning(
+                f"Telegram NetworkError (attempt {attempt}/{retries}): {e}"
+            )
+            if _ssh_tunnel:
+                try:
+                    _ssh_tunnel.ensure_alive()
+                except Exception as te:
+                    _retry_log.error(f"Tunnel restart failed during retry: {te}")
+            await asyncio.sleep(_TG_SEND_RETRY_DELAY)
+    raise last_exc  # type: ignore[misc]
 
 # Memory-notebook auto-sync script path
 AUTO_SYNC_SCRIPT = os.path.expanduser(
@@ -1393,7 +1533,7 @@ async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                     usage_line = usage_info.summary_line()
                     if usage_line:
                         final_text += f"\n📊 {usage_line}"
-                    await thinking_msg.edit_text(final_text)
+                    await _tg_retry(lambda: thinking_msg.edit_text(final_text))
                 except Exception:
                     pass
 
@@ -1402,14 +1542,16 @@ async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             )
             for labeled in parts:
                 try:
-                    await msg.reply_text(labeled, parse_mode=ParseMode.MARKDOWN)
+                    await _tg_retry(lambda l=labeled: msg.reply_text(
+                        l, parse_mode=ParseMode.MARKDOWN))
                 except Exception:
-                    await msg.reply_text(labeled)
+                    await _tg_retry(lambda l=labeled: msg.reply_text(l))
 
             # Auto-send files/images found in response
             sendable = extract_sendable_files(response)
             if sendable:
-                await send_files_to_chat(msg.chat, sendable, session_name, topic_id)
+                await _tg_retry(lambda: send_files_to_chat(
+                    msg.chat, sendable, session_name, topic_id))
     else:
         # No caption - just confirm the file was saved
         await msg.reply_text(plan.reply_text, parse_mode=ParseMode.MARKDOWN)
@@ -1564,7 +1706,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
                 usage_line = usage_info.summary_line()
                 if usage_line:
                     final_text += f"\n📊 {usage_line}"
-                await thinking_msg.edit_text(final_text)
+                await _tg_retry(lambda: thinking_msg.edit_text(final_text))
             except Exception:
                 pass
 
@@ -1574,17 +1716,28 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
         )
         for labeled in parts:
             try:
-                await update.message.reply_text(labeled, parse_mode=ParseMode.MARKDOWN)
+                await _tg_retry(lambda l=labeled: update.message.reply_text(
+                    l, parse_mode=ParseMode.MARKDOWN))
             except Exception:
-                await update.message.reply_text(labeled)
+                await _tg_retry(lambda l=labeled: update.message.reply_text(l))
 
         # Auto-send files/images found in response
         sendable = extract_sendable_files(response)
         if sendable:
-            await send_files_to_chat(update.message.chat, sendable, session_name, topic_id)
+            await _tg_retry(lambda: send_files_to_chat(
+                update.message.chat, sendable, session_name, topic_id))
 
 
 # ─── Lifecycle callbacks ─────────────────────────────────────────────────────
+
+
+async def _ssh_tunnel_health_check(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Periodic job: restart SSH tunnel if it has died."""
+    if _ssh_tunnel:
+        try:
+            _ssh_tunnel.ensure_alive()
+        except Exception as e:
+            log.error(f"SSH tunnel restart failed: {e}")
 
 
 async def post_init(application: Application) -> None:
@@ -1595,6 +1748,13 @@ async def post_init(application: Application) -> None:
     log.info(f"Bot username: @{BOT_USERNAME}")
     if OWNER_USER_ID:
         log.info(f"Owner user ID: {OWNER_USER_ID}")
+
+    # Schedule SSH tunnel health check every 30 seconds
+    if _ssh_tunnel and application.job_queue:
+        application.job_queue.run_repeating(
+            _ssh_tunnel_health_check, interval=30, first=10,
+        )
+        log.info("SSH tunnel health check scheduled (every 30s)")
 
 
 async def post_shutdown(application: Application) -> None:
@@ -1613,12 +1773,22 @@ async def post_shutdown(application: Application) -> None:
 
 def build_application() -> Application:
     """Build application and register handlers without starting polling."""
-    app = (Application.builder()
-           .token(BOT_TOKEN)
-           .concurrent_updates(True)
-           .post_init(post_init)
-           .post_shutdown(post_shutdown)
-           .build())
+    from telegram.request import HTTPXRequest
+
+    builder = (Application.builder()
+               .token(BOT_TOKEN)
+               .concurrent_updates(True)
+               .post_init(post_init)
+               .post_shutdown(post_shutdown))
+
+    if _SOCKS_PROXY_URL:
+        log.info(f"Using SOCKS5 proxy: {_SOCKS_PROXY_URL} (relay: {SSH_PROXY_RELAY})")
+        proxy_request = HTTPXRequest(proxy=_SOCKS_PROXY_URL)
+        builder = builder.request(proxy_request)
+        # Also proxy the get_updates request used by the Updater
+        builder = builder.get_updates_request(HTTPXRequest(proxy=_SOCKS_PROXY_URL))
+
+    app = builder.build()
 
     # Register handlers
     app.add_handler(CommandHandler("start", cmd_start))
@@ -1651,6 +1821,9 @@ def main():
     log.info(f"Working directory: {WORK_DIR}")
     log.info(f"Claude timeout: {CLAUDE_TIMEOUT}s")
     log.info(f"AskUser timeout: {ASK_USER_TIMEOUT}s")
+
+    if SSH_PROXY_RELAY:
+        log.info(f"SSH proxy relay: {SSH_PROXY_RELAY} (pid: {_ssh_tunnel.process.pid if _ssh_tunnel and _ssh_tunnel.process else 'N/A'})")
 
     if ALLOWED_USER_IDS:
         log.info(f"Allowed users: {ALLOWED_USER_IDS}")
