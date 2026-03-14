@@ -9,6 +9,7 @@ including AskUserQuestion support via Telegram inline keyboards.
 
 import asyncio
 import atexit
+import functools
 import logging
 import os
 import re
@@ -684,6 +685,48 @@ def _check_group_auth(update: Update, is_command: bool = False) -> bool | None:
     return should_respond_in_group(update, is_command=is_command)
 
 
+def _require_auth(fn=None, *, is_command: bool = True):
+    """Decorator that adds authorization checks to Telegram handlers.
+
+    Eliminates the repeated 4-line auth boilerplate from every handler.
+
+    Usage::
+
+        @_require_auth                     # is_command=True (silent reject)
+        async def cmd_foo(update, ctx): ...
+
+        @_require_auth(is_command=False)   # unauthorized → reply message
+        async def handle_bar(update, ctx): ...
+    """
+    def decorator(handler):
+        @functools.wraps(handler)
+        async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+            user_id = update.effective_user.id
+            group_auth = _check_group_auth(update, is_command=is_command)
+            if group_auth is False:
+                return
+            if group_auth is None and not is_authorized(user_id):
+                if not is_command:
+                    await update.message.reply_text("Unauthorized. Send /start first.")
+                return
+            return await handler(update, ctx)
+        return wrapper
+    # Support both @_require_auth and @_require_auth(is_command=False)
+    if fn is not None:
+        return decorator(fn)
+    return decorator
+
+
+async def _send_result(update: Update, result) -> object:
+    """Send a use-case result to the user, respecting its ``parse_mode``.
+
+    Returns the sent ``Message`` object (useful when callers need to
+    edit the message later, e.g. for auto-sync status updates).
+    """
+    pm = ParseMode.MARKDOWN if result.parse_mode == "Markdown" else None
+    return await update.message.reply_text(result.reply_text, parse_mode=pm)
+
+
 def extract_reply_context(update: Update) -> str | None:
     """Extract quoted message context when user replies to another bot/user message.
 
@@ -1038,6 +1081,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+@_require_auth
 async def cmd_clear(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /clear [name] - reset a session's conversation context.
 
@@ -1045,14 +1089,7 @@ async def cmd_clear(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         /clear           - clear active session (destroys it, creates new auto-named)
         /clear casimir   - clear named session (keeps name and cwd, resets context)
     """
-    user_id = update.effective_user.id
     topic_id = get_topic_id(update)
-    group_auth = _check_group_auth(update, is_command=True)
-    if group_auth is False:
-        return
-    if group_auth is None and not is_authorized(user_id):
-        return
-
     result = run_clear_session_use_case(
         topic_id=topic_id,
         args=list(ctx.args),
@@ -1060,10 +1097,7 @@ async def cmd_clear(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         clear_session=clear_session,
         get_session_cwd=get_session_cwd,
     )
-    if result.parse_mode == "Markdown":
-        msg = await update.message.reply_text(result.reply_text, parse_mode=ParseMode.MARKDOWN)
-    else:
-        msg = await update.message.reply_text(result.reply_text)
+    msg = await _send_result(update, result)
     if not result.ok:
         return
 
@@ -1080,16 +1114,10 @@ async def cmd_clear(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 pass
 
 
+@_require_auth
 async def cmd_delete(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /delete <name> - delete a specific session."""
-    user_id = update.effective_user.id
     topic_id = get_topic_id(update)
-    group_auth = _check_group_auth(update, is_command=True)
-    if group_auth is False:
-        return
-    if group_auth is None and not is_authorized(user_id):
-        return
-
     result = run_delete_session_use_case(
         topic_id=topic_id,
         args=list(ctx.args),
@@ -1097,10 +1125,7 @@ async def cmd_delete(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         topic_active_session=topic_active_session,
         topic_all_sessions=topic_all_sessions,
     )
-    if result.parse_mode == "Markdown":
-        msg = await update.message.reply_text(result.reply_text, parse_mode=ParseMode.MARKDOWN)
-    else:
-        msg = await update.message.reply_text(result.reply_text)
+    msg = await _send_result(update, result)
     if not result.ok:
         return
 
@@ -1117,15 +1142,10 @@ async def cmd_delete(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
                 pass
 
 
+@_require_auth
 async def cmd_sync(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /sync - manually trigger memory notebook sync."""
-    user_id = update.effective_user.id
     topic_id = get_topic_id(update)
-    group_auth = _check_group_auth(update, is_command=True)
-    if group_auth is False:
-        return
-    if group_auth is None and not is_authorized(user_id):
-        return
 
     sync_init = run_sync_init_use_case(
         topic_id=topic_id,
@@ -1152,6 +1172,7 @@ async def cmd_sync(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(fallback_text)
 
 
+@_require_auth
 async def cmd_new(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /new [name] [cwd] - create a new session and switch to it.
 
@@ -1161,14 +1182,7 @@ async def cmd_new(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         /new build casimir_ashare - named 'build', cwd = project shortname
         /new build ~/ashare      - named 'build', cwd = expanded path
     """
-    user_id = update.effective_user.id
     topic_id = get_topic_id(update)
-    group_auth = _check_group_auth(update, is_command=True)
-    if group_auth is False:
-        return
-    if group_auth is None and not is_authorized(user_id):
-        return
-
     result = run_new_session_use_case(
         topic_id=topic_id,
         args=list(ctx.args),
@@ -1177,22 +1191,13 @@ async def cmd_new(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         create_new_session=create_new_session,
         get_session_cwd=get_session_cwd,
     )
-    if result.parse_mode == "Markdown":
-        await update.message.reply_text(result.reply_text, parse_mode=ParseMode.MARKDOWN)
-    else:
-        await update.message.reply_text(result.reply_text)
+    await _send_result(update, result)
 
 
+@_require_auth
 async def cmd_switch(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /switch <name> - switch to an existing session."""
-    user_id = update.effective_user.id
     topic_id = get_topic_id(update)
-    group_auth = _check_group_auth(update, is_command=True)
-    if group_auth is False:
-        return
-    if group_auth is None and not is_authorized(user_id):
-        return
-
     result = run_switch_session_use_case(
         topic_id=topic_id,
         args=list(ctx.args),
@@ -1200,44 +1205,26 @@ async def cmd_switch(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         switch_session=switch_session,
         topic_all_sessions=topic_all_sessions,
     )
-    if result.parse_mode == "Markdown":
-        await update.message.reply_text(result.reply_text, parse_mode=ParseMode.MARKDOWN)
-    else:
-        await update.message.reply_text(result.reply_text)
+    await _send_result(update, result)
 
 
+@_require_auth
 async def cmd_sessions(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /sessions - list all sessions."""
-    user_id = update.effective_user.id
     topic_id = get_topic_id(update)
-    group_auth = _check_group_auth(update, is_command=True)
-    if group_auth is False:
-        return
-    if group_auth is None and not is_authorized(user_id):
-        return
-
     result = run_sessions_use_case(
         topic_id=topic_id,
         list_sessions=list_sessions,
         session_sdk_ids=session_sdk_ids,
         get_session_cwd=get_session_cwd,
     )
-    if result.parse_mode == "Markdown":
-        await update.message.reply_text(result.reply_text, parse_mode=ParseMode.MARKDOWN)
-    else:
-        await update.message.reply_text(result.reply_text)
+    await _send_result(update, result)
 
 
+@_require_auth
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /status - show bot status."""
-    user_id = update.effective_user.id
     topic_id = get_topic_id(update)
-    group_auth = _check_group_auth(update, is_command=True)
-    if group_auth is False:
-        return
-    if group_auth is None and not is_authorized(user_id):
-        return
-
     result = run_status_use_case(
         topic_id=topic_id,
         topic_all_sessions=topic_all_sessions,
@@ -1249,12 +1236,10 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         timeout_seconds=CLAUDE_TIMEOUT,
         now_str=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
     )
-    if result.parse_mode == "Markdown":
-        await update.message.reply_text(result.reply_text, parse_mode=ParseMode.MARKDOWN)
-    else:
-        await update.message.reply_text(result.reply_text)
+    await _send_result(update, result)
 
 
+@_require_auth
 async def cmd_topic(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /topic [list|info] - topic management commands.
 
@@ -1263,14 +1248,7 @@ async def cmd_topic(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         /topic info     - show current topic info with sessions
         /topic list     - list all known topics with session counts
     """
-    user_id = update.effective_user.id
     topic_id = get_topic_id(update)
-    group_auth = _check_group_auth(update, is_command=True)
-    if group_auth is False:
-        return
-    if group_auth is None and not is_authorized(user_id):
-        return
-
     result = run_topic_use_case(
         topic_id=topic_id,
         args=list(ctx.args),
@@ -1281,12 +1259,10 @@ async def cmd_topic(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         session_sdk_ids=session_sdk_ids,
         get_session_cwd=get_session_cwd,
     )
-    if result.parse_mode == "Markdown":
-        await update.message.reply_text(result.reply_text, parse_mode=ParseMode.MARKDOWN)
-    else:
-        await update.message.reply_text(result.reply_text)
+    await _send_result(update, result)
 
 
+@_require_auth
 async def cmd_cd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /cd [path|shortname] - change working directory for current session.
 
@@ -1297,14 +1273,7 @@ async def cmd_cd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         /cd --global <path>      - change global default WORK_DIR (affects new sessions)
     """
     global WORK_DIR
-    user_id = update.effective_user.id
     topic_id = get_topic_id(update)
-    group_auth = _check_group_auth(update, is_command=True)
-    if group_auth is False:
-        return
-    if group_auth is None and not is_authorized(user_id):
-        return
-
     result = run_cd_use_case(
         topic_id=topic_id,
         args=list(ctx.args),
@@ -1324,22 +1293,13 @@ async def cmd_cd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         sid, new_cwd = result.session_cwd_update
         session_work_dirs[sid] = new_cwd
 
-    if result.parse_mode == "Markdown":
-        await update.message.reply_text(result.reply_text, parse_mode=ParseMode.MARKDOWN)
-    else:
-        await update.message.reply_text(result.reply_text)
+    await _send_result(update, result)
 
 
+@_require_auth
 async def cmd_session(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /session - show current session info."""
-    user_id = update.effective_user.id
     topic_id = get_topic_id(update)
-    group_auth = _check_group_auth(update, is_command=True)
-    if group_auth is False:
-        return
-    if group_auth is None and not is_authorized(user_id):
-        return
-
     result = run_session_info_use_case(
         topic_id=topic_id,
         topic_active_session=topic_active_session,
@@ -1349,26 +1309,17 @@ async def cmd_session(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         session_cwd_locked=session_cwd_locked,
         get_session_cwd=get_session_cwd,
     )
-    if result.parse_mode == "Markdown":
-        await update.message.reply_text(result.reply_text, parse_mode=ParseMode.MARKDOWN)
-    else:
-        await update.message.reply_text(result.reply_text)
+    await _send_result(update, result)
 
 
+@_require_auth
 async def cmd_attach(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /attach <sdk_session_id> <name> - attach external Claude session.
 
     Usage:
         /attach e5f6a7b8-... myname   - attach SDK session with name "myname"
     """
-    user_id = update.effective_user.id
     topic_id = get_topic_id(update)
-    group_auth = _check_group_auth(update, is_command=True)
-    if group_auth is False:
-        return
-    if group_auth is None and not is_authorized(user_id):
-        return
-
     result = run_attach_session_use_case(
         topic_id=topic_id,
         args=list(ctx.args),
@@ -1391,22 +1342,13 @@ async def cmd_attach(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             f"as '{name}' ({sid[:8]}) cwd={result.cwd}"
         )
 
-    if result.parse_mode == "Markdown":
-        await update.message.reply_text(result.reply_text, parse_mode=ParseMode.MARKDOWN)
-    else:
-        await update.message.reply_text(result.reply_text)
+    await _send_result(update, result)
 
 
+@_require_auth
 async def cmd_kill(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /kill [session_name] - interrupt a running Claude session."""
-    user_id = update.effective_user.id
     topic_id = get_topic_id(update)
-    group_auth = _check_group_auth(update, is_command=True)
-    if group_auth is False:
-        return
-    if group_auth is None and not is_authorized(user_id):
-        return
-
     decision = run_kill_use_case(
         topic_id=topic_id,
         args=list(ctx.args),
@@ -1416,10 +1358,7 @@ async def cmd_kill(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
     if not decision.should_interrupt:
-        if decision.parse_mode == "Markdown":
-            await update.message.reply_text(decision.reply_text, parse_mode=ParseMode.MARKDOWN)
-        else:
-            await update.message.reply_text(decision.reply_text)
+        await _send_result(update, decision)
         return
 
     try:
@@ -1433,6 +1372,7 @@ async def cmd_kill(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(f"Failed to interrupt: {e}")
 
 
+@_require_auth
 async def cmd_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /history [N] [session_name] - show recent session conversation.
 
@@ -1442,14 +1382,7 @@ async def cmd_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         /history 10 ashare    - last 10 assistant messages of 'ashare' session
         /history ashare       - last 5 assistant messages of 'ashare' session
     """
-    user_id = update.effective_user.id
     topic_id = get_topic_id(update)
-    group_auth = _check_group_auth(update, is_command=True)
-    if group_auth is False:
-        return
-    if group_auth is None and not is_authorized(user_id):
-        return
-
     resolved = run_history_resolve_use_case(
         topic_id=topic_id,
         args=list(ctx.args),
@@ -1458,10 +1391,7 @@ async def cmd_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         session_sdk_ids=session_sdk_ids,
     )
     if not resolved.ok:
-        if resolved.parse_mode == "Markdown":
-            await update.message.reply_text(resolved.reply_text, parse_mode=ParseMode.MARKDOWN)
-        else:
-            await update.message.reply_text(resolved.reply_text)
+        await _send_result(update, resolved)
         return
 
     n = resolved.n
@@ -1503,16 +1433,10 @@ async def cmd_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
             await update.message.reply_text(part[:TG_MAX_LEN])
 
 
+@_require_auth(is_command=False)
 async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle file/photo/video uploads - download to server and optionally forward to Claude."""
-    user_id = update.effective_user.id
     topic_id = get_topic_id(update)
-    group_auth = _check_group_auth(update)
-    if group_auth is False:
-        return
-    if group_auth is None and not is_authorized(user_id):
-        await update.message.reply_text("Unauthorized. Send /start first.")
-        return
 
     msg = update.message
     file_obj, original_name = select_upload_file(msg)
@@ -1630,6 +1554,7 @@ SKILL_COMMAND_ALLOWLIST: set[str] = {
 }
 
 
+@_require_auth
 async def handle_unknown_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Forward unrecognized /commands to Claude as skill invocations.
 
@@ -1640,16 +1565,6 @@ async def handle_unknown_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
     CLI built-in commands (/skills, /help, etc.) are intercepted and either
     rewritten to natural language or rejected with a message.
     """
-    user_id = update.effective_user.id
-    topic_id = get_topic_id(update)
-    _ = topic_id
-
-    # Group chat: only respond to owner
-    group_auth = _check_group_auth(update, is_command=True)
-    if group_auth is False:
-        return
-    if group_auth is None and not is_authorized(user_id):
-        return
 
     text = update.message.text or ""
     # Extract command name (e.g. "/skills" -> "skills", "/skills@botname" -> "skills")
@@ -1676,18 +1591,10 @@ async def handle_unknown_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
     await handle_message(update, ctx)
 
 
+@_require_auth(is_command=False)
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle regular text messages - forward to Claude with per-session parallel execution."""
-    user_id = update.effective_user.id
     topic_id = get_topic_id(update)
-
-    # Group chat: only respond to owner
-    group_auth = _check_group_auth(update)
-    if group_auth is False:
-        return
-    if group_auth is None and not is_authorized(user_id):
-        await update.message.reply_text("Unauthorized. Send /start first.")
-        return
 
     text = update.message.text
     if not text:
