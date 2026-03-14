@@ -145,6 +145,7 @@ class TestCd:
             topic_active_session={},
             topic_all_sessions={},
             session_work_dirs={},
+            session_cwd_locked={},
             get_session_cwd=lambda _sid: "/tmp/work",
             resolve_cwd=lambda _arg: None,
             get_project_shortcuts=lambda: {},
@@ -160,6 +161,7 @@ class TestSessionInfo:
             topic_all_sessions={},
             session_sdk_ids={},
             session_work_dirs={},
+            session_cwd_locked={},
             get_session_cwd=lambda _sid: "/tmp",
         )
         assert "No active session" in result.reply_text

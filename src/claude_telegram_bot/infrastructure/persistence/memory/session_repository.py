@@ -18,6 +18,7 @@ class InMemorySessionRepository:
         self.topic_session_counter: dict[int, int] = {}
         self.topic_names: dict[int, str] = {}
         self.session_work_dirs: dict[str, str] = {}
+        self.session_cwd_locked: dict[str, bool] = {}
 
     def get_session_lock(self, session_id: str) -> asyncio.Lock:
         if session_id not in self.session_locks:
@@ -104,6 +105,7 @@ class InMemorySessionRepository:
             old_cwd = self.session_work_dirs.get(old_sid)
             self.session_sdk_ids.pop(old_sid, None)
             self.session_work_dirs.pop(old_sid, None)
+            self.session_cwd_locked.pop(old_sid, None)
             self.session_locks.pop(old_sid, None)
             self.session_pending.pop(old_sid, None)
             self.session_clients.pop(old_sid, None)
@@ -126,6 +128,7 @@ class InMemorySessionRepository:
             old_cwd = self.session_work_dirs.get(old_sid)
             self.session_sdk_ids.pop(old_sid, None)
             self.session_work_dirs.pop(old_sid, None)
+            self.session_cwd_locked.pop(old_sid, None)
             self.session_locks.pop(old_sid, None)
             self.session_pending.pop(old_sid, None)
             self.session_clients.pop(old_sid, None)
@@ -161,6 +164,7 @@ class InMemorySessionRepository:
         sessions.pop(name)
         self.session_sdk_ids.pop(sid, None)
         self.session_work_dirs.pop(sid, None)
+        self.session_cwd_locked.pop(sid, None)
         self.session_locks.pop(sid, None)
         self.session_pending.pop(sid, None)
         self.session_clients.pop(sid, None)

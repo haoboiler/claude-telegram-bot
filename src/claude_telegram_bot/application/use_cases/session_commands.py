@@ -68,6 +68,17 @@ class SyncInitResult:
 
 
 @dataclass
+class AttachSessionResult:
+    ok: bool
+    reply_text: str
+    parse_mode: Optional[str]
+    session_name: Optional[str] = None
+    session_id: Optional[str] = None
+    sdk_session_id: Optional[str] = None
+    cwd: Optional[str] = None
+
+
+@dataclass
 class HistoryResolveResult:
     ok: bool
     reply_text: Optional[str]
@@ -249,13 +260,16 @@ def run_sessions_use_case(
         marker = " <- active" if is_active else ""
         has_context = sid in session_sdk_ids
         status = "BUSY" if is_busy else ("has context" if has_context else "empty")
+        sdk_sid = session_sdk_ids.get(sid)
+        sdk_label = f"  sdk:`{sdk_sid[:8]}`" if sdk_sid else ""
         s_cwd = get_session_cwd(sid).replace(home, "~")
-        lines.append(f"  `{name}` ({status}){marker}\n    📁 `{s_cwd}`")
+        lines.append(f"  `{name}` ({status}){marker}{sdk_label}\n    📁 `{s_cwd}`")
     lines.append(f"\nTotal: {len(sessions)}")
     lines.append(
         "\nQuick reference:\n"
         "  /switch <name> - Switch to session\n"
         "  /new [name] [cwd] - Create new session\n"
+        "  /attach <sdk_id> <name> - Attach external session\n"
         "  /delete <name> - Delete a session\n"
         "  /clear [name] - Reset session context\n"
         "  /cd [path] - Change session cwd\n"
@@ -388,6 +402,7 @@ def run_cd_use_case(
     topic_active_session: dict[int, str],
     topic_all_sessions: dict[int, dict[str, str]],
     session_work_dirs: dict[str, str],
+    session_cwd_locked: dict[str, bool],
     get_session_cwd: Callable[[str], str],
     resolve_cwd: Callable[[Optional[str]], Optional[str]],
     get_project_shortcuts: Callable[[], dict[str, str]],
@@ -455,6 +470,15 @@ def run_cd_use_case(
             parse_mode=None,
         )
 
+    if active_sid in session_cwd_locked:
+        return CdResult(
+            reply_text=(
+                f"Session `{active_name}` cwd is locked (attached session).\n"
+                f"Use /clear to reset the session first."
+            ),
+            parse_mode="Markdown",
+        )
+
     return CdResult(
         reply_text=f"Session `{active_name}` cwd changed to:\n`{display}`{shortcut_note}",
         parse_mode="Markdown",
@@ -469,6 +493,7 @@ def run_session_info_use_case(
     topic_all_sessions: dict[int, dict[str, str]],
     session_sdk_ids: dict[str, str],
     session_work_dirs: dict[str, str],
+    session_cwd_locked: dict[str, bool],
     get_session_cwd: Callable[[str], str],
 ) -> TextResult:
     active_name = topic_active_session.get(topic_id)
@@ -480,14 +505,30 @@ def run_session_info_use_case(
         home = os.path.expanduser("~")
         s_cwd = get_session_cwd(sid).replace(home, "~")
         is_custom = sid in session_work_dirs
-        cwd_label = f"`{s_cwd}`" + (" (custom)" if is_custom else " (global)")
+        is_locked = sid in session_cwd_locked
+        cwd_suffix = " (locked)" if is_locked else (" (custom)" if is_custom else " (global)")
+        cwd_label = f"`{s_cwd}`{cwd_suffix}"
+
+        lines = [
+            f"Current session: `{active_name}` ({status})",
+            f"Session ID: `{sid}`",
+        ]
+
+        sdk_sid = session_sdk_ids.get(sid)
+        if sdk_sid:
+            lines.append(f"SDK Session: `{sdk_sid}`")
+
+        lines.append(f"Work dir: {cwd_label}")
+        lines.append(f"Total sessions: {len(sessions)}")
+
+        if sdk_sid:
+            lines.append(
+                f"\nTerminal resume:\n"
+                f"`cd {s_cwd} && claude --resume {sdk_sid}`"
+            )
+
         return TextResult(
-            reply_text=(
-                f"Current session: `{active_name}` ({status})\n"
-                f"Session ID: `{sid}`\n"
-                f"Work dir: {cwd_label}\n"
-                f"Total sessions: {len(sessions)}"
-            ),
+            reply_text="\n".join(lines),
             parse_mode="Markdown",
         )
     return TextResult(
@@ -713,4 +754,114 @@ def run_history_resolve_use_case(
         session_name=session_name,
         session_id=session_id,
         sdk_sid=sdk_sid,
+    )
+
+
+def run_attach_session_use_case(
+    *,
+    topic_id: int,
+    args: list[str],
+    topic_all_sessions: dict[int, dict[str, str]],
+    find_sdk_session: Callable[[str], Optional[tuple[str, str]]],
+    check_active_terminal: Callable[[str], Optional[int]],
+    validate_sdk_id: Callable[[str], bool],
+    session_sdk_ids: dict[str, str],
+) -> AttachSessionResult:
+    """Attach an external Claude SDK session to the bot.
+
+    Usage: /attach <sdk_session_id> <name>
+    """
+    if len(args) < 2:
+        return AttachSessionResult(
+            ok=False,
+            reply_text=(
+                "Usage: `/attach <sdk_session_id> <name>`\n\n"
+                "Get SDK session IDs with:\n"
+                "  `/session` — current session\n"
+                "  `claude --resume` — in terminal (interactive picker)"
+            ),
+            parse_mode="Markdown",
+        )
+
+    sdk_session_id = args[0]
+    name = args[1]
+
+    # Validate UUID format
+    if not validate_sdk_id(sdk_session_id):
+        return AttachSessionResult(
+            ok=False,
+            reply_text=f"Invalid SDK session ID: `{sdk_session_id}`\nExpected UUID format.",
+            parse_mode="Markdown",
+        )
+
+    # Check name not taken
+    sessions = topic_all_sessions.get(topic_id, {})
+    if name in sessions:
+        return AttachSessionResult(
+            ok=False,
+            reply_text=f"Session name `{name}` already exists. Choose a different name.",
+            parse_mode="Markdown",
+        )
+
+    # Check SDK session ID not already attached
+    for existing_sid, existing_sdk in session_sdk_ids.items():
+        if existing_sdk == sdk_session_id:
+            # Find which session name has it
+            for tid, sess in topic_all_sessions.items():
+                for sname, ssid in sess.items():
+                    if ssid == existing_sid:
+                        return AttachSessionResult(
+                            ok=False,
+                            reply_text=(
+                                f"SDK session `{sdk_session_id[:8]}...` is already "
+                                f"attached to session `{sname}`."
+                            ),
+                            parse_mode="Markdown",
+                        )
+            break
+
+    # Find the JSONL file and extract cwd
+    lookup_result = find_sdk_session(sdk_session_id)
+    if lookup_result is None:
+        return AttachSessionResult(
+            ok=False,
+            reply_text=(
+                f"SDK session `{sdk_session_id[:8]}...` not found.\n"
+                f"No JSONL file found in `~/.claude/projects/`."
+            ),
+            parse_mode="Markdown",
+        )
+
+    _, cwd = lookup_result
+
+    # Check for active terminal session
+    active_pid = check_active_terminal(sdk_session_id)
+    if active_pid is not None:
+        return AttachSessionResult(
+            ok=False,
+            reply_text=(
+                f"SDK session `{sdk_session_id[:8]}...` is currently "
+                f"active in terminal (PID {active_pid}).\n"
+                f"Close the terminal session first, then retry."
+            ),
+            parse_mode="Markdown",
+        )
+
+    # Success — return result for cmd_attach to execute side effects
+    home = os.path.expanduser("~")
+    cwd_display = cwd.replace(home, "~")
+
+    return AttachSessionResult(
+        ok=True,
+        reply_text=(
+            f"Attached session: `{name}`\n"
+            f"SDK: `{sdk_session_id[:8]}...`\n"
+            f"Project: `{cwd_display}` (locked)\n\n"
+            f"To resume in terminal:\n"
+            f"`cd {cwd_display} && claude --resume {sdk_session_id}`"
+        ),
+        parse_mode="Markdown",
+        session_name=name,
+        sdk_session_id=sdk_session_id,
+        cwd=cwd,
     )

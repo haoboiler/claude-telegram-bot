@@ -78,6 +78,7 @@ class SqliteSessionRepository:
         "topic_session_counter",
         "topic_names",
         "session_work_dirs",
+        "session_cwd_locked",
     )
 
     def __init__(self, db_path: str) -> None:
@@ -141,6 +142,14 @@ class SqliteSessionRepository:
     @session_work_dirs.setter
     def session_work_dirs(self, value: dict[str, str]) -> None:
         self._memory.session_work_dirs = value
+
+    @property
+    def session_cwd_locked(self) -> dict[str, bool]:
+        return self._memory.session_cwd_locked
+
+    @session_cwd_locked.setter
+    def session_cwd_locked(self, value: dict[str, bool]) -> None:
+        self._memory.session_cwd_locked = value
 
     # ── Proxied dict attributes (runtime-only — not persisted) ───────────
 
@@ -341,6 +350,11 @@ class SqliteSessionRepository:
             for k, v in (raw.get("session_work_dirs", {}) or {}).items()
         }
 
+        self._memory.session_cwd_locked = {
+            str(k): bool(v)
+            for k, v in (raw.get("session_cwd_locked", {}) or {}).items()
+        }
+
     def _snapshot(self) -> dict[str, Any]:
         m = self._memory
         return {
@@ -359,6 +373,7 @@ class SqliteSessionRepository:
                 str(k): v for k, v in m.topic_names.items()
             },
             "session_work_dirs": dict(m.session_work_dirs),
+            "session_cwd_locked": dict(m.session_cwd_locked),
         }
 
     def _persist_state(self) -> None:
@@ -416,4 +431,7 @@ class SqliteSessionRepository:
         )
         m.session_work_dirs = _AutoPersistDict(
             m.session_work_dirs, on_change=self._persist_state,
+        )
+        m.session_cwd_locked = _AutoPersistDict(
+            m.session_cwd_locked, on_change=self._persist_state,
         )

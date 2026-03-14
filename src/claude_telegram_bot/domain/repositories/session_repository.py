@@ -17,6 +17,7 @@ class SessionRepository(Protocol):
     topic_session_counter: dict[int, int]
     topic_names: dict[int, str]
     session_work_dirs: dict[str, str]
+    session_cwd_locked: dict[str, bool]
 
     def get_session_lock(self, session_id: str) -> asyncio.Lock: ...
     def next_default_name(self, topic_id: int) -> str: ...

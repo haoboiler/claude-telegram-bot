@@ -28,6 +28,7 @@ from src.claude_telegram_bot.bootstrap.auth_state import (
     resolve_auth_bootstrap_state,
 )
 from src.claude_telegram_bot.application.use_cases.session_commands import (
+    run_attach_session_use_case,
     run_cd_use_case,
     run_clear_session_use_case,
     run_delete_session_use_case,
@@ -41,6 +42,11 @@ from src.claude_telegram_bot.application.use_cases.session_commands import (
     run_status_use_case,
     run_switch_session_use_case,
     run_topic_use_case,
+)
+from src.claude_telegram_bot.infrastructure.claude.session_lookup import (
+    check_active_terminal_session,
+    find_sdk_session,
+    validate_sdk_session_id,
 )
 from src.claude_telegram_bot.application.use_cases.ask_user import (
     parse_ask_callback_data,
@@ -393,6 +399,7 @@ session_clients = SESSION_REPO.session_clients
 topic_session_counter = SESSION_REPO.topic_session_counter
 topic_names = SESSION_REPO.topic_names
 session_work_dirs = SESSION_REPO.session_work_dirs
+session_cwd_locked = SESSION_REPO.session_cwd_locked
 
 # Project shortname -> full path mapping
 # Fallback shortcuts (used if shortcuts.yaml is missing or parse fails)
@@ -1305,6 +1312,7 @@ async def cmd_cd(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         topic_active_session=topic_active_session,
         topic_all_sessions=topic_all_sessions,
         session_work_dirs=session_work_dirs,
+        session_cwd_locked=session_cwd_locked,
         get_session_cwd=get_session_cwd,
         resolve_cwd=resolve_cwd,
         get_project_shortcuts=get_project_shortcuts,
@@ -1338,8 +1346,51 @@ async def cmd_session(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         topic_all_sessions=topic_all_sessions,
         session_sdk_ids=session_sdk_ids,
         session_work_dirs=session_work_dirs,
+        session_cwd_locked=session_cwd_locked,
         get_session_cwd=get_session_cwd,
     )
+    if result.parse_mode == "Markdown":
+        await update.message.reply_text(result.reply_text, parse_mode=ParseMode.MARKDOWN)
+    else:
+        await update.message.reply_text(result.reply_text)
+
+
+async def cmd_attach(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /attach <sdk_session_id> <name> - attach external Claude session.
+
+    Usage:
+        /attach e5f6a7b8-... myname   - attach SDK session with name "myname"
+    """
+    user_id = update.effective_user.id
+    topic_id = get_topic_id(update)
+    group_auth = _check_group_auth(update, is_command=True)
+    if group_auth is False:
+        return
+    if group_auth is None and not is_authorized(user_id):
+        return
+
+    result = run_attach_session_use_case(
+        topic_id=topic_id,
+        args=list(ctx.args),
+        topic_all_sessions=topic_all_sessions,
+        find_sdk_session=find_sdk_session,
+        check_active_terminal=check_active_terminal_session,
+        validate_sdk_id=validate_sdk_session_id,
+        session_sdk_ids=session_sdk_ids,
+    )
+
+    if result.ok:
+        # Execute side effects: create session, bind SDK ID, lock cwd
+        name, sid = SESSION_REPO.create_new_session(
+            topic_id, name=result.session_name, cwd=result.cwd, logger=log,
+        )
+        session_sdk_ids[sid] = result.sdk_session_id
+        session_cwd_locked[sid] = True
+        log.info(
+            f"Attached SDK session {result.sdk_session_id[:8]} "
+            f"as '{name}' ({sid[:8]}) cwd={result.cwd}"
+        )
+
     if result.parse_mode == "Markdown":
         await update.message.reply_text(result.reply_text, parse_mode=ParseMode.MARKDOWN)
     else:
@@ -1799,6 +1850,7 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("cd", cmd_cd))
     app.add_handler(CommandHandler("session", cmd_session))
+    app.add_handler(CommandHandler("attach", cmd_attach))
     app.add_handler(CommandHandler("kill", cmd_kill))
     app.add_handler(CommandHandler("delete", cmd_delete))
     app.add_handler(CommandHandler("sync", cmd_sync))
