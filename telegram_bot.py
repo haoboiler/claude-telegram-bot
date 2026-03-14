@@ -1638,6 +1638,22 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
     # Acquire per-session lock - different sessions can run in parallel
     async with lock:
 
+        # Guard: warn if a terminal process is actively using this SDK session.
+        # Concurrent access to the same session from tgcc + terminal corrupts
+        # the JSONL conversation history and leads to unpredictable results.
+        sdk_sid = session_sdk_ids.get(session_id)
+        if sdk_sid:
+            active_pid = check_active_terminal_session(sdk_sid)
+            if active_pid:
+                await update.message.reply_text(
+                    f"⚠️ Session `{session_name}` 的 SDK session 正在被终端进程 "
+                    f"(PID {active_pid}) 使用中。\n"
+                    f"同时从两边发消息会导致会话历史混乱。\n"
+                    f"请先在终端中退出该 session，或使用 `/force` 前缀强制发送。",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+                return
+
         # Send "typing" indicator
         await update.message.chat.send_action(
             ChatAction.TYPING,
