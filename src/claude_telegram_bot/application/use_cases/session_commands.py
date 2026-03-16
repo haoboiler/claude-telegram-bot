@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Callable, Optional
 
 
@@ -864,4 +865,119 @@ def run_attach_session_use_case(
         session_name=name,
         sdk_session_id=sdk_session_id,
         cwd=cwd,
+    )
+
+
+# ── Browse SDK sessions ─────────────────────────────────────────────────
+
+
+def _format_size(n: int) -> str:
+    if n >= 1_048_576:
+        return f"{n / 1_048_576:.1f}MB"
+    if n >= 1024:
+        return f"{n / 1024:.0f}KB"
+    return f"{n}B"
+
+
+def run_browse_use_case(
+    *,
+    args: list[str],
+    list_project_dirs: Callable[[], list[tuple[str, int]]],
+    list_sdk_sessions: Callable[..., list],
+    session_sdk_ids: dict[str, str],
+) -> TextResult:
+    """Browse SDK session JSONL files on disk.
+
+    Usage:
+        /browse              — list project directories
+        /browse <project>    — sessions in project (last 7 days)
+        /browse <project> N  — sessions in project (last N days)
+        /browse all          — all projects (last 7 days)
+    """
+    home = os.path.expanduser("~")
+
+    # Determine filter and max_age_days from args
+    project_filter: str | None = None
+    max_age_days = 7
+
+    if not args:
+        # List project directories
+        dirs = list_project_dirs()
+        if not dirs:
+            return TextResult(
+                reply_text="No SDK session directories found.",
+                parse_mode=None,
+            )
+        lines = ["📂 Project directories:\n"]
+        for dirname, count in dirs:
+            # Make the dirname more readable: strip leading dash, replace dashes
+            display = dirname.replace("-home-gkh-", "~/").replace("-", "/")
+            lines.append(f"  `{display}` ({count} sessions)")
+        lines.append(
+            f"\nTotal: {len(dirs)} projects\n"
+            "\nUsage:\n"
+            "  `/browse <keyword>` — sessions matching keyword (7 days)\n"
+            "  `/browse <keyword> 30` — last 30 days\n"
+            "  `/browse all` — all projects (7 days)"
+        )
+        return TextResult(reply_text="\n".join(lines), parse_mode="Markdown")
+
+    # Parse args
+    if len(args) >= 2:
+        try:
+            max_age_days = int(args[1])
+        except ValueError:
+            pass
+
+    keyword = args[0]
+    if keyword.lower() == "all":
+        project_filter = None
+    else:
+        project_filter = keyword
+
+    # Collect already-attached SDK IDs for marking
+    attached_sdk_ids = set(session_sdk_ids.values())
+
+    sessions = list_sdk_sessions(
+        project_filter=project_filter,
+        max_age_days=max_age_days,
+    )
+
+    if not sessions:
+        label = f"matching `{keyword}`" if project_filter else "across all projects"
+        return TextResult(
+            reply_text=f"No sessions found {label} in the last {max_age_days} days.",
+            parse_mode="Markdown",
+        )
+
+    # Group by project_dir
+    by_project: dict[str, list] = {}
+    for s in sessions:
+        by_project.setdefault(s.project_dir, []).append(s)
+
+    lines: list[str] = []
+    total = 0
+    for proj_dir, proj_sessions in by_project.items():
+        display = proj_dir.replace("-home-gkh-", "~/").replace("-", "/")
+        lines.append(f"📁 `{display}` ({len(proj_sessions)} sessions)\n")
+        for s in proj_sessions:
+            total += 1
+            dt = datetime.fromtimestamp(s.mtime).strftime("%m-%d %H:%M")
+            size = _format_size(s.size_bytes)
+            attached = " ✅attached" if s.session_id in attached_sdk_ids else ""
+            msg = s.first_message.replace("\n", " ").strip()
+            if msg:
+                msg = msg[:50]
+            else:
+                msg = "(empty)"
+            lines.append(f"  `{dt}` {size}{attached}")
+            lines.append(f"  `{s.session_id}`")
+            lines.append(f"  _{msg}_\n")
+        lines.append("")
+
+    header = f"SDK Sessions (last {max_age_days}d): {total} found\n\n"
+    footer = "→ `/attach <session_id> <name>` to attach"
+    return TextResult(
+        reply_text=header + "\n".join(lines) + footer,
+        parse_mode="Markdown",
     )

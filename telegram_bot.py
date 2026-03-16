@@ -30,6 +30,7 @@ from src.claude_telegram_bot.bootstrap.auth_state import (
 )
 from src.claude_telegram_bot.application.use_cases.session_commands import (
     run_attach_session_use_case,
+    run_browse_use_case,
     run_cd_use_case,
     run_clear_session_use_case,
     run_delete_session_use_case,
@@ -47,6 +48,8 @@ from src.claude_telegram_bot.application.use_cases.session_commands import (
 from src.claude_telegram_bot.infrastructure.claude.session_lookup import (
     check_active_terminal_session,
     find_sdk_session,
+    list_project_dirs,
+    list_sdk_sessions,
     validate_sdk_session_id,
 )
 from src.claude_telegram_bot.application.use_cases.ask_user import (
@@ -1346,6 +1349,18 @@ async def cmd_attach(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 @_require_auth
+async def cmd_browse(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle /browse [project] [days] - browse SDK sessions on disk."""
+    result = run_browse_use_case(
+        args=list(ctx.args),
+        list_project_dirs=list_project_dirs,
+        list_sdk_sessions=list_sdk_sessions,
+        session_sdk_ids=session_sdk_ids,
+    )
+    await _send_result(update, result)
+
+
+@_require_auth
 async def cmd_kill(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle /kill [session_name] - interrupt a running Claude session."""
     topic_id = get_topic_id(update)
@@ -1451,7 +1466,7 @@ async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         save_path = resolve_upload_path(UPLOAD_DIR, original_name)
 
         await tg_file.download_to_drive(save_path)
-        log.info(f"File downloaded: {save_path} (from user {user_id})")
+        log.info(f"File downloaded: {save_path} (from user {update.effective_user.id})")
     except Exception as e:
         log.exception("File download failed")
         await msg.reply_text(f"Download failed: {e}")
@@ -1774,6 +1789,7 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("cd", cmd_cd))
     app.add_handler(CommandHandler("session", cmd_session))
     app.add_handler(CommandHandler("attach", cmd_attach))
+    app.add_handler(CommandHandler("browse", cmd_browse))
     app.add_handler(CommandHandler("kill", cmd_kill))
     app.add_handler(CommandHandler("delete", cmd_delete))
     app.add_handler(CommandHandler("sync", cmd_sync))
