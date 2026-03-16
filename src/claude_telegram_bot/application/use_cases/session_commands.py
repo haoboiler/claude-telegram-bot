@@ -262,7 +262,7 @@ def run_sessions_use_case(
         has_context = sid in session_sdk_ids
         status = "BUSY" if is_busy else ("has context" if has_context else "empty")
         sdk_sid = session_sdk_ids.get(sid)
-        sdk_label = f"  sdk:`{sdk_sid[:8]}`" if sdk_sid else ""
+        sdk_label = f"  sdk: `{sdk_sid[:8]}`" if sdk_sid else ""
         s_cwd = get_session_cwd(sid).replace(home, "~")
         lines.append(f"  `{name}` ({status}){marker}{sdk_label}\n    📁 `{s_cwd}`")
     lines.append(f"\nTotal: {len(sessions)}")

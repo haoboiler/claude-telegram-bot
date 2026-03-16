@@ -196,6 +196,25 @@ def list_project_dirs() -> list[tuple[str, int]]:
     return result
 
 
+def _normalize_to_dirname(value: str) -> str:
+    """Normalize a user-supplied path/keyword to the dirname format used
+    under ``~/.claude/projects/``.
+
+    Claude Code encodes project paths by replacing ``/`` with ``-``, e.g.
+    ``/home/gkh/my_project`` → ``-home-gkh-my-project``.  Underscores in
+    the *original* filesystem path are also replaced with ``-``.
+
+    This helper applies the same transformations so that user inputs like
+    ``~/claude_tasks/crypto_rawdata`` can match the encoded dirname
+    ``-home-gkh-claude-tasks-crypto-rawdata``.
+    """
+    # Expand ~ to actual home directory
+    value = os.path.expanduser(value)
+    # Replace path separators and underscores with dashes (matching dirname encoding)
+    value = value.replace("/", "-").replace("_", "-")
+    return value.lower()
+
+
 def list_sdk_sessions(
     project_filter: str | None = None,
     max_age_days: int = 7,
@@ -206,7 +225,9 @@ def list_sdk_sessions(
     ----------
     project_filter
         If given, only scan directories whose name contains this
-        substring (case-insensitive).  Use ``None`` to scan all.
+        substring (case-insensitive).  Accepts raw paths (e.g.
+        ``~/my_project``) which are normalized to the encoded dirname
+        format used by Claude Code.  Use ``None`` to scan all.
     max_age_days
         Only return sessions modified within this many days.
 
@@ -222,11 +243,14 @@ def list_sdk_sessions(
     cutoff = time.time() - max_age_days * 86400
     sessions: list[SdkSessionInfo] = []
 
+    # Normalize the filter so paths like ~/foo_bar match -home-gkh-foo-bar
+    normalized_filter = _normalize_to_dirname(project_filter) if project_filter else None
+
     for dirname in os.listdir(projects_dir):
         full = os.path.join(projects_dir, dirname)
         if not os.path.isdir(full):
             continue
-        if project_filter and project_filter.lower() not in dirname.lower():
+        if normalized_filter and normalized_filter not in dirname.lower():
             continue
 
         for fname in os.listdir(full):

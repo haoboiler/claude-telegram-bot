@@ -77,6 +77,7 @@ RUNTIME_PATHS = build_runtime_paths(PROJECT_ROOT, INSTANCE_NAME)
 load_runtime_env(RUNTIME_PATHS)
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.error import BadRequest as TelegramBadRequest
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -725,9 +726,15 @@ async def _send_result(update: Update, result) -> object:
 
     Returns the sent ``Message`` object (useful when callers need to
     edit the message later, e.g. for auto-sync status updates).
+
+    Falls back to plain text if Markdown parsing fails.
     """
     pm = ParseMode.MARKDOWN if result.parse_mode == "Markdown" else None
-    return await update.message.reply_text(result.reply_text, parse_mode=pm)
+    try:
+        return await update.message.reply_text(result.reply_text, parse_mode=pm)
+    except TelegramBadRequest:
+        # Markdown parse failure — retry as plain text
+        return await update.message.reply_text(result.reply_text, parse_mode=None)
 
 
 def extract_reply_context(update: Update) -> str | None:
