@@ -28,10 +28,16 @@ SENDABLE_EXTS = IMAGE_EXTS | {
 # Telegram file size limit (50MB for bots)
 TG_FILE_SIZE_LIMIT = 50 * 1024 * 1024
 
-# Regex to find file paths in response text
-# Matches absolute paths and paths starting with ./
+# Regex to find file paths in response text.
+# Two branches (the matched path is whichever group is non-empty):
+#   1. Backtick-wrapped: `/path/to/My File (1).md` — allows spaces, parens and
+#      any non-backtick chars, so filenames with spaces are captured. Claude is
+#      instructed (via the delivery system prompt) to wrap paths in backticks.
+#   2. Bare path: /path/to/file.md or ./file.md — no spaces (can't tell where it
+#      ends without a delimiter); kept for backward compatibility.
 FILE_PATH_RE = re.compile(
-    r'(?:^|[\s`\'"])(/[\w./_-]+\.[\w]+|\.\/[\w./_-]+\.[\w]+)',
+    r'`\s*((?:/|\./)[^`\n]+?\.[\w]+)\s*`'
+    r'|(?:^|[\s\'"])(/[\w./_-]+\.[\w]+|\.\/[\w./_-]+\.[\w]+)',
 )
 
 
@@ -69,7 +75,7 @@ def extract_sendable_files(
     files = []
 
     for match in FILE_PATH_RE.finditer(text):
-        path = match.group(1)
+        path = (match.group(1) or match.group(2)).strip()
         if path.startswith("./"):
             path = os.path.join(work_dir, path[2:])
         path = os.path.abspath(path)
