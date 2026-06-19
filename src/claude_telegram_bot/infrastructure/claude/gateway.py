@@ -170,6 +170,10 @@ class ClaudeGateway:
             start_time = time.time()
             last_edit_time = 0.0
             last_heartbeat_time = start_time
+            # Liveness clock: advances on every model turn (tool call OR text),
+            # independent of whether we have displayable narration. The stall
+            # warning keys off this so silent tool work isn't flagged as stuck.
+            last_progress_time = start_time
             edit_throttle = 3.0
 
             async for msg in client.receive_response():
@@ -194,6 +198,7 @@ class ClaudeGateway:
                     activity_log.append(activity)
 
                 if isinstance(msg, AssistantMessage):
+                    last_progress_time = now  # any model turn counts as alive
                     for block in msg.content:
                         if isinstance(block, TextBlock) and block.text:
                             last_assistant_text = block.text
@@ -214,7 +219,7 @@ class ClaudeGateway:
                     except Exception:
                         pass
 
-                    if not activity_log or (now - last_edit_time) >= self.config.stall_warn_timeout:
+                    if (now - last_progress_time) >= self.config.stall_warn_timeout:
                         if thinking_msg:
                             mins, secs = divmod(int(elapsed), 60)
                             time_str = f"{mins}m{secs:02d}s" if mins else f"{secs}s"
