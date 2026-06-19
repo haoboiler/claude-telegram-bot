@@ -18,6 +18,34 @@ from telegram.constants import ChatAction
 from .activity import extract_activity
 
 
+# Appended to Claude Code's default system prompt for sessions driven by this
+# Telegram bot. Tells Claude how file delivery actually works so it stops
+# (a) claiming files were sent when they weren't and (b) curl-ing the Telegram
+# API itself to a guessed chat_id (which lands in the wrong chat).
+TELEGRAM_DELIVERY_SYSTEM_PROMPT = """\
+## Delivering files to the user (Telegram)
+
+You are running inside a Telegram bot. The user reads your final reply as a \
+Telegram message. To send a file (document or image) to the user, simply write \
+its absolute path in your final reply, wrapped in backticks, e.g. \
+`/home/user/report.md`. The bot automatically detects such paths and uploads \
+the file to the correct chat (the same group/topic or DM the user messaged from).
+
+Rules — follow these exactly:
+- Do NOT send files yourself via curl, the Telegram Bot API, or any HTTP \
+request. You do not know the correct chat_id; doing so delivers the file to the \
+wrong chat (often a private DM instead of the group). Just put the path in your reply.
+- A file is only delivered if it exists on disk, has a supported extension \
+(.md, .txt, .pdf, .csv, .png, .jpg, .jpeg, .gif, .webp, etc.), and is under \
+50 MB. If a file is too large or unsupported, tell the user plainly instead of \
+claiming it was sent.
+- Do NOT claim a file was sent unless its absolute path appears in your FINAL \
+reply. Mentioning the path only in intermediate steps is not enough.
+- If a filename contains spaces or special characters, still write the full \
+absolute path wrapped in backticks.
+"""
+
+
 @dataclass
 class ClaudeGatewayConfig:
     max_turns: int
@@ -106,6 +134,11 @@ class ClaudeGateway:
             cwd=effective_cwd,
             max_turns=self.config.max_turns,
             permission_mode="bypassPermissions",
+            system_prompt={
+                "type": "preset",
+                "preset": "claude_code",
+                "append": TELEGRAM_DELIVERY_SYSTEM_PROMPT,
+            },
             can_use_tool=(
                 self.make_can_use_tool(chat, session_name, topic_id) if chat else None
             ),
