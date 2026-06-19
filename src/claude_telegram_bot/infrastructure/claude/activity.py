@@ -20,7 +20,7 @@ TOOL_LABELS = {
 }
 
 
-def summarize_narration(text: str, limit: int = 280) -> str:
+def summarize_narration(text: str, limit: int = 500) -> str:
     """Collapse a multi-line narration into a single trimmed line for the activity log."""
     collapsed = " ".join(text.split())
     if len(collapsed) > limit:

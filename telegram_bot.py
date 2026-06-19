@@ -790,12 +790,20 @@ async def _update_thinking_msg(thinking_msg, activity_log: list[str],
     mins, secs = divmod(int(elapsed), 60)
     time_str = f"{mins}m{secs:02d}s" if mins else f"{secs}s"
     label = f"[{session_name}] " if session_name else ""
-    recent = activity_log[-10:]
-    log_text = "\n".join(f"  ▸ {a}" for a in recent)
-    if len(activity_log) > 10:
-        log_text = f"  ... ({len(activity_log) - 10} earlier)\n" + log_text
+    header = f"{label}Working... ({time_str})\n"
+    recent = activity_log[-50:]
+    dropped = len(activity_log) - len(recent)
+    # Trim oldest of the recent window if it would exceed Telegram's limit.
+    lines = [f"  ▸ {a}" for a in recent]
+    log_text = "\n".join(lines)
+    while lines and len(header) + len(log_text) > 3500:
+        lines.pop(0)
+        dropped += 1
+        log_text = "\n".join(lines)
+    if dropped > 0:
+        log_text = f"  ... ({dropped} earlier)\n" + log_text
     try:
-        await thinking_msg.edit_text(f"{label}Working... ({time_str})\n{log_text}")
+        await thinking_msg.edit_text(f"{header}{log_text}")
     except Exception:
         pass
 
