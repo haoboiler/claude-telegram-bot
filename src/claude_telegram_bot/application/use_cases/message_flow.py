@@ -49,13 +49,33 @@ def render_progress_reply(session_name: str, *, is_file_caption: bool = False) -
     return f"[{session_name}] Thinking..."
 
 
-def render_final_activity_reply(session_name: str, activity_log: list[str]) -> str:
-    """Render final cumulative activity log text."""
+def render_final_activity_reply(
+    session_name: str, activity_log: list[str], max_len: int = 3500
+) -> str:
+    """Render final cumulative activity log text.
+
+    Keeps the full step count in the header but trims older lines from the
+    front if the rendered log would exceed ``max_len`` (Telegram messages cap
+    at 4096 chars), so the edit never silently fails on long sessions.
+    """
     label = f"[{session_name}] " if session_name else ""
-    if activity_log:
-        log_text = "\n".join(f"  ▸ {a}" for a in activity_log)
-        return f"{label}Done ({len(activity_log)} steps)\n{log_text}"
-    return f"{label}Done"
+    if not activity_log:
+        return f"{label}Done"
+
+    header = f"{label}Done ({len(activity_log)} steps)\n"
+    lines = [f"  ▸ {a}" for a in activity_log]
+    log_text = "\n".join(lines)
+
+    # Trim oldest lines until it fits, prepending an elision marker.
+    dropped = 0
+    while lines and len(header) + len(log_text) > max_len:
+        lines.pop(0)
+        dropped += 1
+        log_text = "\n".join(lines)
+    if dropped:
+        log_text = f"  ... ({dropped} earlier)\n{log_text}"
+
+    return f"{header}{log_text}"
 
 
 def run_label_response_parts_use_case(session_name: str, parts: list[str]) -> list[str]:

@@ -20,8 +20,22 @@ TOOL_LABELS = {
 }
 
 
+def summarize_narration(text: str, limit: int = 280) -> str:
+    """Collapse a multi-line narration into a single trimmed line for the activity log."""
+    collapsed = " ".join(text.split())
+    if len(collapsed) > limit:
+        collapsed = collapsed[:limit].rstrip() + "…"
+    return collapsed
+
+
 def extract_activity(msg) -> Optional[str]:
-    """Extract user-friendly activity description from an SDK message."""
+    """Extract user-friendly activity description from an SDK message.
+
+    Tool calls are summarized to a short label; assistant narration text
+    (Claude's running commentary — findings, decisions, next steps) is
+    surfaced verbatim (truncated) since that is the genuinely useful info,
+    rather than a generic "Thinking..." placeholder.
+    """
     if not isinstance(msg, AssistantMessage):
         return None
 
@@ -46,9 +60,9 @@ def extract_activity(msg) -> Optional[str]:
                 return f"{label}: {desc}" if desc else label
             return label
         elif isinstance(block, TextBlock):
-            text = block.text
+            text = (block.text or "").strip()
             if text:
-                return "Thinking..."
+                return summarize_narration(text)
 
     return None
 
