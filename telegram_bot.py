@@ -1639,6 +1639,11 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
     if not text:
         return
 
+    # 记录群聊触发意图 (必须在 strip 之前判断): 用户 @了 bot 或消息在 forum
+    # topic 内 = 明确要触发 Claude, 应豁免下方的 @session/ 前缀 guard。
+    mentioned_bot = bool(BOT_USERNAME) and f"@{BOT_USERNAME}" in text
+    is_topic_msg = bool(getattr(update.message, "is_topic_message", False))
+
     # Strip @bot_username mention from message text (common in groups)
     text = strip_bot_mention(text)
     if not text:
@@ -1652,7 +1657,10 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None
     # Group chat input guard: require @session prefix to trigger Claude call.
     # This prevents casual messages from wasting tokens.
     # Commands forwarded from handle_unknown_command (starting with "/") are exempt.
-    if _is_group_chat(update) and not text.startswith("@") and not text.startswith("/"):
+    # 豁免: @了 bot 或在 forum topic 内 = 明确触发意图 (否则 @bot 的消息会被
+    # strip_bot_mention 去掉前缀后卡在这里, 静默丢弃)。
+    if (_is_group_chat(update) and not is_topic_msg and not mentioned_bot
+            and not text.startswith("@") and not text.startswith("/")):
         return
 
     # Extract reply context (for cross-bot info transfer in groups)
