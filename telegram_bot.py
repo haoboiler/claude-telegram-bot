@@ -132,6 +132,14 @@ if not BOT_TOKEN:
 # Restrict to your Telegram user ID (set after first /start)
 ALLOWED_USER_IDS_ENV = os.environ.get("TELEGRAM_ALLOWED_USERS", "")
 
+# Group auth mode: "owner" (default, owner-only in groups) or "allowed"
+# (any TELEGRAM_ALLOWED_USERS member may talk in groups — multi-user bots)
+GROUP_AUTH_MODE = os.environ.get("TELEGRAM_GROUP_AUTH_MODE", "owner").strip().lower()
+if GROUP_AUTH_MODE not in ("owner", "allowed"):
+    raise SystemExit(
+        f"Invalid TELEGRAM_GROUP_AUTH_MODE={GROUP_AUTH_MODE!r} (use 'owner' or 'allowed')"
+    )
+
 # Working directory for claude CLI
 WORK_DIR = os.environ.get("CLAUDE_WORK_DIR", os.getcwd())
 
@@ -673,6 +681,7 @@ def should_respond_in_group(update: Update, is_command: bool = False) -> bool:
         allowed_user_ids=ALLOWED_USER_IDS,
         bot_username=BOT_USERNAME,
         logger=log,
+        group_auth_mode=GROUP_AUTH_MODE,
     )
 
 

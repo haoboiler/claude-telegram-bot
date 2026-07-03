@@ -16,14 +16,25 @@ def should_respond_in_group(
     allowed_user_ids: set[int],
     bot_username: str,
     logger=None,
+    group_auth_mode: str = "owner",
 ) -> bool:
-    """Determine if the bot should respond to this message in a group chat."""
+    """Determine if the bot should respond to this message in a group chat.
+
+    group_auth_mode:
+        "owner" (default) — original semantics: when an owner exists, only the
+            owner may talk in groups; allowed_user_ids only applies ownerless.
+        "allowed" — any user in allowed_user_ids (or the owner) may talk in
+            groups. For multi-user group bots (e.g. trader interview groups).
+    """
     if not is_group_chat(update):
         return True  # Private chat
 
     user_id = update.effective_user.id
 
-    if owner_user_id:
+    if group_auth_mode == "allowed":
+        if user_id != owner_user_id and user_id not in allowed_user_ids:
+            return False
+    elif owner_user_id:
         if user_id != owner_user_id:
             return False
     elif allowed_user_ids:
