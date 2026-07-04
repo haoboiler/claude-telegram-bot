@@ -1571,6 +1571,11 @@ async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         await msg.reply_text(plan.reply_text, parse_mode=ParseMode.MARKDOWN)
 
 
+# Optional instance-level /help override: when TELEGRAM_HELP_TEXT_FILE points
+# to a readable file, /help replies with its content directly (no Claude call).
+# "\n---\n" in the file splits it into multiple Telegram messages.
+HELP_TEXT_FILE = os.environ.get("TELEGRAM_HELP_TEXT_FILE", "")
+
 # CLI built-in commands that don't work through the SDK.
 # Map to natural language rewrites where possible, None = unsupported.
 CLI_BUILTIN_REWRITES: dict[str, str | None] = {
@@ -1608,6 +1613,22 @@ async def handle_unknown_command(update: Update, ctx: ContextTypes.DEFAULT_TYPE)
     text = update.message.text or ""
     # Extract command name (e.g. "/skills" -> "skills", "/skills@botname" -> "skills")
     cmd = text.split()[0].lstrip("/").split("@")[0].lower() if text else ""
+
+    # Instance help override: serve TELEGRAM_HELP_TEXT_FILE content directly
+    if cmd == "help" and HELP_TEXT_FILE and os.path.exists(HELP_TEXT_FILE):
+        try:
+            content = open(HELP_TEXT_FILE, encoding="utf-8").read()
+        except OSError:
+            content = ""
+        if content.strip():
+            for block in content.split("\n---\n"):
+                for part in split_message(block.strip()):
+                    try:
+                        await update.message.reply_text(
+                            part, parse_mode=ParseMode.MARKDOWN)
+                    except Exception:
+                        await update.message.reply_text(part)
+            return
 
     if cmd in CLI_BUILTIN_REWRITES:
         rewrite = CLI_BUILTIN_REWRITES[cmd]
