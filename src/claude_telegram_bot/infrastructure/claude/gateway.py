@@ -46,6 +46,24 @@ absolute path wrapped in backticks.
 """
 
 
+def _extra_system_prompt() -> str:
+    """Instance-level extra system prompt appended to every Claude call.
+
+    TELEGRAM_SYSTEM_PROMPT_FILE (env) points to a text file; its content is
+    re-read on every call, so edits take effect for ONGOING sessions from
+    their next message — no /clear, no restart, no context loss.
+    """
+    import os
+    path = os.environ.get("TELEGRAM_SYSTEM_PROMPT_FILE", "")
+    if not path or not os.path.exists(path):
+        return ""
+    try:
+        content = open(path, encoding="utf-8").read().strip()
+    except OSError:
+        return ""
+    return ("\n\n" + content) if content else ""
+
+
 @dataclass
 class ClaudeGatewayConfig:
     max_turns: int
@@ -137,7 +155,7 @@ class ClaudeGateway:
             system_prompt={
                 "type": "preset",
                 "preset": "claude_code",
-                "append": TELEGRAM_DELIVERY_SYSTEM_PROMPT,
+                "append": TELEGRAM_DELIVERY_SYSTEM_PROMPT + _extra_system_prompt(),
             },
             can_use_tool=(
                 self.make_can_use_tool(chat, session_name, topic_id) if chat else None
