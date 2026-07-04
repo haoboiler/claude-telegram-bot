@@ -791,6 +791,21 @@ def strip_bot_mention(text: str) -> str:
     return text
 
 
+def _progress_line() -> str:
+    """Read live progress from TELEGRAM_PROGRESS_FILE (written by long jobs,
+    e.g. the backtest engine). Shown only when fresh (<120s)."""
+    path = os.environ.get("TELEGRAM_PROGRESS_FILE", "")
+    if not path:
+        return ""
+    try:
+        if time.time() - os.path.getmtime(path) > 120:
+            return ""
+        line = open(path, encoding="utf-8").read().strip()
+        return (line[:200] + "\n") if line else ""
+    except OSError:
+        return ""
+
+
 async def _update_thinking_msg(thinking_msg, activity_log: list[str],
                                session_name: str, elapsed: float):
     """Update the thinking message with current activity log (throttled by caller)."""
@@ -799,7 +814,7 @@ async def _update_thinking_msg(thinking_msg, activity_log: list[str],
     mins, secs = divmod(int(elapsed), 60)
     time_str = f"{mins}m{secs:02d}s" if mins else f"{secs}s"
     label = f"[{session_name}] " if session_name else ""
-    header = f"{label}Working... ({time_str})\n"
+    header = f"{label}Working... ({time_str})\n" + _progress_line()
     recent = activity_log[-50:]
     dropped = len(activity_log) - len(recent)
     # Trim oldest of the recent window if it would exceed Telegram's limit.
