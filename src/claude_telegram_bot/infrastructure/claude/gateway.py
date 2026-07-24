@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import time
 from dataclasses import dataclass
 from typing import Callable, Optional
@@ -16,6 +17,15 @@ from claude_agent_sdk import (
 from telegram.constants import ChatAction
 
 from .activity import extract_activity
+
+
+# The SDK "initialize" control-request handshake can transiently time out when
+# the outbound proxy / network stalls for a moment (the spawned CLI starts but
+# its init reply never arrives within the SDK's ~60s control-request timeout).
+# Retry the connect a couple times with a fresh client before surfacing an error
+# so a brief hiccup doesn't turn into a user-visible failure.
+_INIT_MAX_ATTEMPTS = 2  # total connect() tries (1 original + 1 retry)
+_INIT_RETRY_BACKOFF = 2.0  # seconds, multiplied by attempt number
 
 
 # Appended to Claude Code's default system prompt for sessions driven by this
@@ -177,7 +187,31 @@ class ClaudeGateway:
         self.session_clients[session_id] = client
 
         try:
-            await client.connect()
+            # Connect with retry: the init handshake can transiently time out on
+            # a proxy/network blip. On a non-fatal failure, recreate the client
+            # and retry; ProcessError (CLI crashed / bad resume) is re-raised so
+            # the resume-fallback handler below still runs.
+            for _init_attempt in range(1, _INIT_MAX_ATTEMPTS + 1):
+                try:
+                    await client.connect()
+                    break
+                except ProcessError:
+                    raise
+                except Exception as e:
+                    if _init_attempt >= _INIT_MAX_ATTEMPTS:
+                        raise
+                    self.log.warning(
+                        f"SDK init attempt {_init_attempt}/{_INIT_MAX_ATTEMPTS} "
+                        f"failed for {session_id[:8]}: {e}; "
+                        f"recreating client and retrying"
+                    )
+                    try:
+                        await client.disconnect()
+                    except Exception:
+                        pass
+                    await asyncio.sleep(_INIT_RETRY_BACKOFF * _init_attempt)
+                    client = ClaudeSDKClient(options=options)
+                    self.session_clients[session_id] = client
             await client.query(prompt)
 
             activity_log: list[str] = []
