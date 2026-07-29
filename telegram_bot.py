@@ -163,6 +163,13 @@ ASK_USER_TIMEOUT = int(os.environ.get("ASK_USER_TIMEOUT", "300"))
 UPLOAD_DIR = os.environ.get("UPLOAD_DIR", os.path.join(WORK_DIR, "uploads"))
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
+# Read timeout (seconds) for downloading a file body from Telegram. PTB's default
+# is only 5s, which is fine for small requests (getFile/sendMessage) but too short
+# when the file body streams through a congested SOCKS tunnel / an overloaded box:
+# any >5s stall in the byte stream raises ReadTimeout and the download fails while
+# small API calls still succeed. Give downloads a generous inactivity budget.
+FILE_DOWNLOAD_TIMEOUT = int(os.environ.get("FILE_DOWNLOAD_TIMEOUT", "120"))
+
 # Session repository backend: memory (default) or sqlite.
 _DEFAULT_SQLITE_REPO_PATH = (
     str(RUNTIME_PATHS.project_root / "instances" / f"{INSTANCE_NAME}.sessions.sqlite")
@@ -1505,7 +1512,13 @@ async def handle_file(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         tg_file = await file_obj.get_file()
         save_path = resolve_upload_path(UPLOAD_DIR, original_name)
 
-        await tg_file.download_to_drive(save_path)
+        await tg_file.download_to_drive(
+            save_path,
+            read_timeout=FILE_DOWNLOAD_TIMEOUT,
+            write_timeout=FILE_DOWNLOAD_TIMEOUT,
+            connect_timeout=30,
+            pool_timeout=30,
+        )
         log.info(f"File downloaded: {save_path} (from user {update.effective_user.id})")
     except Exception as e:
         log.exception("File download failed")
